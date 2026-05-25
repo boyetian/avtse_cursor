@@ -12,16 +12,31 @@ EPS = 1e-8
 class ScaledSinuEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        self.dim = dim
         self.scale = nn.Parameter(torch.ones(1,))
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
+        self._rknn_safe = False
+        self.register_buffer("_rknn_scale_weight", torch.zeros(0), persistent=False)
+
+    def enable_rknn_safe(self):
+        """Replace scalar Mul(* self.scale) with depthwise Conv1d for RKNN export."""
+        self._rknn_safe = True
+        with torch.no_grad():
+            self._rknn_scale_weight = self.scale.item() * torch.ones(self.dim, 1, 1)
 
     def forward(self, x):
         n, device = x.shape[1], x.device
         t = torch.arange(n, device=device).type_as(self.inv_freq)
         sinu = torch.mul(t.unsqueeze(-1), self.inv_freq.unsqueeze(0))
         emb = torch.cat((sinu.sin(), sinu.cos()), dim=-1)
-        return emb * self.scale
+        if not self._rknn_safe:
+            return emb * self.scale
+        # RKNN-safe: depthwise conv1d instead of scalar * self.scale
+        # emb is [T, C]; conv1d needs [1, C, T]
+        emb_t = emb.unsqueeze(0).transpose(1, 2)
+        emb_t = F.conv1d(emb_t, self._rknn_scale_weight, groups=self.dim)
+        return emb_t.transpose(1, 2).squeeze(0)
 
 
 class Linear(torch.nn.Module):
