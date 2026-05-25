@@ -1,0 +1,21 @@
+# Minimal dependencies for inference only
+# Used by: infer_ingress_stream.sh -> infer_mp4_ingress_stream.py
+
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+numpy==1.26.4
+opencv-python==4.5.4.60
+soundfile==0.12.1
+librosa==0.10.2
+PyYAML==6.0.3
+yamlargparse==1.31.1
+tqdm==4.66.5
+mediapipe>=0.10.0
+
+# Model internals
+rotary-embedding-torch==0.8.3
+
+--index-url http://pypi.local.xmov.ai/xmov/release/+simple/
+--trusted-host pypi.local.xmov.ai
+--extra-index-url https://mirrors.cloud.tencent.com/pypi/simple

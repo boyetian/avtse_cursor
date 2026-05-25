@@ -1,0 +1,5 @@
+*.onnx
+*.pyc
+*.wav
+*.mp4
+Miniforge3-Linux-x86_64.sh
