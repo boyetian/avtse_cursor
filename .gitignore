@@ -5,3 +5,7 @@
 Miniforge3-Linux-x86_64.sh
 *.pt
 *.rknn
+*.exe
+*.pt
+*.jpg
+*.pcm
