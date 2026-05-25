@@ -14,6 +14,7 @@ StreamInferenceSDK::StreamInferenceSDK(const StreamInferenceSDKOptions& opt) : o
   AVStreamInferenceOptions core_opt;
   core_opt.config_yaml = opt.config_yaml;
   core_opt.onnx_path = opt.onnx_path;
+  core_opt.ref_onnx_path = opt.ref_onnx_path;
   core_opt.rknn_path = opt.rknn_path;
   core_opt.onnx_num_threads = opt.onnx_num_threads;
   core_opt.infer_chunk_ms =

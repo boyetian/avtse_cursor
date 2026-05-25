@@ -42,7 +42,11 @@ AVStreamInference::AVStreamInference(const AVStreamInferenceOptions& opt)
                  normalizeModeForBackbone(cfg_.backbone)) {
 #if defined(AV_TSE_USE_RKNN) && AV_TSE_USE_RKNN
   if (opt_.rknn_path.empty()) {
-    throw std::invalid_argument("AVStreamInference requires rknn_path");
+    throw std::invalid_argument("AVStreamInference requires rknn_path (sep RKNN)");
+  }
+  if (opt_.ref_onnx_path.empty()) {
+    throw std::invalid_argument(
+        "AVStreamInference RKNN split deploy requires ref_onnx_path (av_mossformer_ref_fixed.onnx)");
   }
 #else
   if (opt_.onnx_path.empty()) {
@@ -63,7 +67,8 @@ AVStreamInference::AVStreamInference(const AVStreamInferenceOptions& opt)
   drop_unit_enc_ = std::max(1, drop_unit_samples_ / encoder_stride);
 
 #if defined(AV_TSE_USE_RKNN) && AV_TSE_USE_RKNN
-  model_ = std::make_unique<AvMossformerRknn>(opt_.rknn_path);
+  model_ = std::make_unique<AvMossformerSplit>(opt_.ref_onnx_path, opt_.rknn_path, 0, 0, image_size_,
+                                               opt_.onnx_num_threads);
 #else
   model_ = std::make_unique<AvMossformerOnnx>(opt_.onnx_path, opt_.onnx_num_threads);
 #endif

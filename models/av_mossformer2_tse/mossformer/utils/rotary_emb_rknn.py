@@ -22,7 +22,7 @@ class RotaryEmbedding(_RotaryEmbeddingBase):
         if (
             should_cache
             and self.cached_freqs is not None
-            and (offset + seq_len) <= self.cached_freqs_seq_len.item()
+            and (offset + seq_len) <= self.cached_freqs_seq_len
         ):
             return self.cached_freqs[offset : (offset + seq_len)].detach()
 
@@ -34,6 +34,9 @@ class RotaryEmbedding(_RotaryEmbeddingBase):
 
         if should_cache and offset == 0:
             self.cached_freqs[:seq_len] = freqs_out.detach()
-            self.cached_freqs_seq_len.copy_(seq_len)
+            if isinstance(self.cached_freqs_seq_len, torch.Tensor):
+                self.cached_freqs_seq_len.fill_(int(seq_len))
+            else:
+                self.cached_freqs_seq_len = int(seq_len)
 
         return freqs_out

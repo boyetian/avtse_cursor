@@ -90,88 +90,173 @@ def build_model(cfg, ckpt_path):
     return model
 
 
-class MossformerOnnxExport(nn.Module):
-    """Wrap network_wrapper for full or sep-only ONNX export."""
-
-    def __init__(self, net: nn.Module, export_part: str = "full", ref_is_gray: bool = False):
-        super().__init__()
-        self.net = net
-        self.export_part = str(export_part)
-        self.ref_is_gray = ref_is_gray  # True: ref is already 4D grayscale [B, T, H, W]
-
-    def forward(self, mixture, ref):
-        if self.export_part == "sep":
-            return self._forward_sep(mixture, ref)
-        # Full model: convert RGB to gray if needed
-        if not self.ref_is_gray:
-            ref = self.net._video_rgb_to_gray(ref)
-        return self.net.model(mixture, ref)
-
-    def _forward_sep(self, mixture, ref):
-        ref = ref.to(mixture.device)
-        if not self.ref_is_gray:
-            ref = self.net._video_rgb_to_gray(ref)
-        h = getattr(self.net.args.network_audio, "mossformer_face_size", None) or getattr(
-            self.net.args.network_audio, "image_size", 112
-        )
-        w = h
-        if ref.shape[2] != h or ref.shape[3] != w:
-            b, t, _, _ = ref.shape
-            ref = ref.reshape(b * t, 1, ref.shape[2], ref.shape[3])
-            ref = F.interpolate(ref, size=(h, w), mode="bilinear", align_corners=False)
-            ref = ref.reshape(b, t, h, w)
-        mixture_w, est_mask = self.net.model.forward_sep(mixture, ref)
-        return torch.cat([mixture_w, est_mask], dim=1)
-
-
-class MossformerDecoderOnnxExport(nn.Module):
-    """Decoder + tail pad; inputs mixture_w, est_mask, target_audio_len (scalar tensor)."""
-
-    def __init__(self, net: nn.Module):
-        super().__init__()
-        self.decoder = net.model.sep_network.decoder
-
-    def forward(self, mixture_w, est_mask, target_audio_len: torch.Tensor):
-        est = self.decoder(mixture_w, est_mask)
-        pad_len = target_audio_len.reshape(-1)[0] - est.size(-1)
-        tail = est.new_zeros(est.size(0), pad_len)
-        return torch.cat([est, tail], dim=-1)
-
-
-def _configure_decoder_ola_gather_add(model, chunk_size: int = 512) -> None:
-    """Use chunked const-index Add OLA (no ScatterElements in ONNX)."""
-    decoder = _resolve_mossformer_decoder(model)
-    if decoder is None:
-        return
-    decoder.set_ola_export_mode("gather_add", chunk_size=int(chunk_size))
-    print(f"[export] decoder OLA mode=gather_add chunk_size={chunk_size}")
-
-
-def _resolve_mossformer_decoder(model) -> Optional[nn.Module]:
-    decoder = getattr(model, "decoder", None)
-    if decoder is not None:
-        return decoder
-    inner = getattr(model, "net", None) or getattr(model, "model", None)
-    if inner is None:
-        return None
-    if hasattr(inner, "model"):
-        inner = inner.model
-    sep = getattr(inner, "sep_network", None)
-    if sep is None:
-        return None
-    return getattr(sep, "decoder", None)
-
-
 def _pin_decoder_ola_for_export(model, t_audio: int, kernel_size: int = 16) -> None:
     """Set decoder OLA fold matrix for fixed-length ONNX trace (avoids 100k+ node loop unroll)."""
-    decoder = _resolve_mossformer_decoder(model)
-    if decoder is None:
+    inner = getattr(model, "model", None)
+    if inner is None:
+        return
+    sep = getattr(inner, "sep_network", None)
+    if sep is None or not hasattr(sep, "decoder"):
         return
     from models.av_mossformer2_tse.av_mossformer2 import encoder_frame_count
 
     t_enc = encoder_frame_count(int(t_audio), int(kernel_size))
-    decoder.set_fixed_ola_frames(t_enc)
+    sep.decoder.set_fixed_ola_frames(t_enc)
     print(f"[export] decoder OLA pinned T_frames={t_enc} (audio_len={t_audio})")
+
+
+def _use_decoder_ola_conv_for_export(model) -> None:
+    """RKNN sep export: ConvTranspose OLA instead of scatter_add (ScatterElements)."""
+    inner = getattr(model, "model", None)
+    if inner is None:
+        return
+    sep = getattr(inner, "sep_network", None)
+    if sep is None or not hasattr(sep, "decoder"):
+        return
+    sep.decoder.clear_fixed_ola_frames()
+    print("[export] decoder OLA: ConvTranspose path (RKNN sep, no ScatterElements)")
+
+
+class RefEncoderOnnxWrapper(nn.Module):
+    """Gray lip video [B,T,H,W] -> ref_feat [B,C,T] for ORT on CPU."""
+
+    def __init__(self, ref_encoder: nn.Module, image_size: int):
+        super().__init__()
+        self.ref_encoder = ref_encoder
+        self.image_size = int(image_size)
+
+    def forward(self, ref_gray: torch.Tensor) -> torch.Tensor:
+        h = w = self.image_size
+        if ref_gray.shape[2] != h or ref_gray.shape[3] != w:
+            b, t = ref_gray.shape[0], ref_gray.shape[1]
+            x = ref_gray.reshape(b * t, 1, ref_gray.shape[2], ref_gray.shape[3])
+            x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+            ref_gray = x.reshape(b, t, h, w)
+        return self.ref_encoder(ref_gray)
+
+
+class SepOnnxWrapper(nn.Module):
+    """Mossformer separator path: mixture + ref_feat -> separated audio."""
+
+    def __init__(self, sep_network: nn.Module):
+        super().__init__()
+        self.sep_network = sep_network
+
+    def forward(self, mixture: torch.Tensor, ref_feat: torch.Tensor) -> torch.Tensor:
+        return self.sep_network(mixture, ref_feat)
+
+
+def export_ref_encoder_onnx(
+    model,
+    output_path: str,
+    opset: int,
+    t_ref: int,
+    image_size: int,
+) -> int:
+    inner = getattr(model, "model", None)
+    if inner is None or not hasattr(inner, "ref_encoder"):
+        raise RuntimeError("model.model.ref_encoder not found")
+    wrap = RefEncoderOnnxWrapper(inner.ref_encoder, image_size).eval()
+    dummy = torch.randn(1, int(t_ref), int(image_size), int(image_size), dtype=torch.float32)
+    print(
+        f"[ONNX/ref_encoder] tracing ref_gray=(1, {t_ref}, {image_size}, {image_size}) -> ref_feat"
+    )
+    with torch.no_grad():
+        torch.onnx.export(
+            wrap,
+            (dummy,),
+            output_path,
+            input_names=["ref_gray"],
+            output_names=["ref_feat"],
+            opset_version=opset,
+            do_constant_folding=True,
+        )
+    mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"[ONNX/ref_encoder] saved {output_path} ({mb:.1f} MB)")
+    return int(t_ref)
+
+
+def export_sep_rknn_onnx(
+    model,
+    output_path: str,
+    opset: int,
+    t_audio: int,
+    t_ref: int,
+    ref_feat_channels: int = 96,
+    use_ola_conv: bool = False,
+) -> tuple[int, int]:
+    inner = getattr(model, "model", None)
+    if inner is None or not hasattr(inner, "sep_network"):
+        raise RuntimeError("model.model.sep_network not found")
+    if use_ola_conv:
+        _use_decoder_ola_conv_for_export(model)
+        print("[export] decoder OLA: ConvTranspose (RKNN experimental, may differ from training scatter)")
+    else:
+        _pin_decoder_ola_for_export(model, t_audio)
+        print("[export] decoder OLA: scatter_add (matches training; ScatterElements in ONNX)")
+    wrap = SepOnnxWrapper(inner.sep_network).eval()
+    dummy_mix = torch.randn(1, int(t_audio), dtype=torch.float32)
+    dummy_feat = torch.randn(1, int(ref_feat_channels), int(t_ref), dtype=torch.float32)
+    print(
+        f"[ONNX/sep] tracing mixture=(1, {t_audio}), ref_feat=(1, {ref_feat_channels}, {t_ref})"
+    )
+    with torch.no_grad():
+        torch.onnx.export(
+            wrap,
+            (dummy_mix, dummy_feat),
+            output_path,
+            input_names=["mixture", "ref_feat"],
+            output_names=["output"],
+            opset_version=opset,
+            do_constant_folding=True,
+        )
+    mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"[ONNX/sep] saved {output_path} ({mb:.1f} MB)")
+    return int(t_audio), int(t_ref)
+
+
+def export_rknn_split_onnx(
+    model,
+    ref_out: str,
+    sep_out: str,
+    opset: int,
+    audio_sr: int = 16000,
+    ref_sr: float = 30.0,
+    context_ms: float = 100.0,
+    infer_chunk_ms: float = 500.0,
+    lookahead_ms: float = 0.0,
+    image_size: int = 96,
+    ref_feat_channels: int = 96,
+    sep_rknn_out: Optional[str] = None,
+) -> tuple[int, int]:
+    t_audio, t_ref = compute_stream_window_lengths(
+        audio_sr=audio_sr,
+        ref_sr=ref_sr,
+        context_ms=context_ms,
+        infer_chunk_ms=infer_chunk_ms,
+        lookahead_ms=lookahead_ms,
+    )
+    export_ref_encoder_onnx(model, ref_out, opset, t_ref, image_size)
+    export_sep_rknn_onnx(
+        model,
+        sep_out,
+        opset,
+        t_audio,
+        t_ref,
+        ref_feat_channels=ref_feat_channels,
+        use_ola_conv=False,
+    )
+    if sep_rknn_out:
+        export_sep_rknn_onnx(
+            model,
+            sep_rknn_out,
+            opset,
+            t_audio,
+            t_ref,
+            ref_feat_channels=ref_feat_channels,
+            use_ola_conv=True,
+        )
+    return t_audio, t_ref
 
 
 def compute_stream_window_lengths(
@@ -201,9 +286,6 @@ def export_onnx(
     lookahead_ms: float = 0.0,
     image_size: int = 96,
     fixed: bool = False,
-    decoder_ola: str = "scatter",
-    export_part: str = "full",
-    ref_is_gray: bool = False,
 ):
     if fixed:
         t_audio, t_ref = compute_stream_window_lengths(
@@ -222,45 +304,13 @@ def export_onnx(
         t_ref = max(2, int(round(float(t_audio) / float(audio_sr) * float(ref_sr))))
 
     dummy_mixture = torch.randn(1, t_audio, dtype=torch.float32)
-    if ref_is_gray:
-        # 4D grayscale ref: [B, T, H, W], RKNN friendly (no 5D ops)
-        # Note: rgb_to_gray should be done as preprocessing before feeding to RKNN
-        dummy_ref = torch.randn(1, t_ref, int(image_size), int(image_size), dtype=torch.float32)
-    else:
-        # 5D RGB ref: [B, T, H, W, 3]
-        dummy_ref = torch.randn(1, t_ref, int(image_size), int(image_size), 3, dtype=torch.float32)
-
-    export_part = str(export_part)
-    if export_part == "sep":
-        input_names = ["mixture", "ref"]
-        output_names = ["sep_pack"]
-        export_inputs = (dummy_mixture, dummy_ref)
-    elif export_part == "decoder":
-        from models.av_mossformer2_tse.av_mossformer2 import encoder_frame_count
-
-        t_enc = encoder_frame_count(int(t_audio), 16)
-        dec = _resolve_mossformer_decoder(model)
-        n_ch = int(getattr(dec, "N", 512)) if dec is not None else 512
-        dummy_mw = torch.randn(1, n_ch, t_enc, dtype=torch.float32)
-        dummy_mask = torch.randn(1, n_ch, t_enc, dtype=torch.float32)
-        dummy_tlen = torch.tensor([int(t_audio)], dtype=torch.int64)
-        input_names = ["mixture_w", "est_mask", "target_audio_len"]
-        output_names = ["output"]
-        export_inputs = (dummy_mw, dummy_mask, dummy_tlen)
-    else:
-        input_names = ["mixture", "ref"]
-        output_names = ["output"]
-        export_inputs = (dummy_mixture, dummy_ref)
-
-    do_fold = True
-    if export_part == "full" and decoder_ola == "conv":
-        do_fold = False
+    dummy_ref = torch.randn(1, t_ref, int(image_size), int(image_size), 3, dtype=torch.float32)
 
     export_kw = dict(
-        input_names=input_names,
-        output_names=output_names,
+        input_names=["mixture", "ref"],
+        output_names=["output"],
         opset_version=opset,
-        do_constant_folding=do_fold,
+        do_constant_folding=True,
     )
     if not fixed:
         export_kw["dynamic_axes"] = {
@@ -270,28 +320,14 @@ def export_onnx(
         }
 
     mode = "fixed" if fixed else "dynamic"
-    ref_shape_str = f"(1, {t_ref}, {image_size}, {image_size})" if ref_is_gray else f"(1, {t_ref}, {image_size}, {image_size}, 3)"
     print(
         f"[ONNX/{mode}] tracing (opset={opset}) ... "
-        f"mixture=(1, {t_audio}), ref={ref_shape_str}"
+        f"mixture=(1, {t_audio}), ref=(1, {t_ref}, {image_size}, {image_size}, 3)"
     )
-    if export_part == "full" and fixed and decoder_ola in ("scatter", "gather_add"):
+    if fixed:
         _pin_decoder_ola_for_export(model, t_audio)
-        if decoder_ola == "gather_add":
-            _configure_decoder_ola_gather_add(model)
-    elif export_part == "full" and fixed:
-        print(f"[export] decoder OLA mode={decoder_ola} (ConvTranspose1d, no scatter pin)")
-    if export_part == "decoder" and fixed and decoder_ola in ("scatter", "gather_add"):
-        dec = _resolve_mossformer_decoder(model)
-        if dec is not None:
-            from models.av_mossformer2_tse.av_mossformer2 import encoder_frame_count
-
-            t_enc = encoder_frame_count(int(t_audio), 16)
-            dec.set_fixed_ola_frames(t_enc)
-            if decoder_ola == "gather_add":
-                dec.set_ola_export_mode("gather_add", chunk_size=512)
     with torch.no_grad():
-        torch.onnx.export(model, export_inputs, output_path, **export_kw)
+        torch.onnx.export(model, (dummy_mixture, dummy_ref), output_path, **export_kw)
     mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"[ONNX/{mode}] 保存到 {output_path} ({mb:.1f} MB)")
     return int(t_audio), int(t_ref)
@@ -631,18 +667,7 @@ def verify(
         t_ref = 100
     np.random.seed(42)
     mix_np = np.random.randn(1, int(t_audio)).astype(np.float32)
-    # Auto-detect ref shape based on ONNX model input (5D RGB or 4D grayscale)
-    ref_shape = None
-    for i in inp:
-        if i.name == "ref":
-            ref_shape = i.shape
-            break
-    if ref_shape is not None and len(ref_shape) == 4:
-        # 4D grayscale ref: [B, T, H, W]
-        ref_np = np.random.randn(1, int(t_ref), image_size, image_size).astype(np.float32)
-    else:
-        # 5D RGB ref: [B, T, H, W, 3]
-        ref_np = np.random.randn(1, int(t_ref), image_size, image_size, 3).astype(np.float32)
+    ref_np = np.random.randn(1, int(t_ref), image_size, image_size, 3).astype(np.float32)
 
     try:
         result = sess.run(None, {"mixture": mix_np, "ref": ref_np})
@@ -656,6 +681,71 @@ def verify(
             pt_out = model(torch.from_numpy(mix_np), torch.from_numpy(ref_np)).numpy()
         diff = np.abs(pt_out - result[0]).max()
         print(f"[{label}] max|PyTorch - ONNX| = {diff:.6e}")
+
+
+def verify_rknn_split_onnx(
+    ref_onnx_path: str,
+    sep_onnx_path: str,
+    model=None,
+    t_audio: Optional[int] = None,
+    t_ref: Optional[int] = None,
+    image_size: int = 96,
+    ref_feat_channels: int = 96,
+) -> None:
+    """ORT ref_encoder + sep vs full network_wrapper (RGB)."""
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("[split verify] skip: onnxruntime not installed")
+        return
+
+    if t_audio is None or t_ref is None:
+        t_audio, t_ref = compute_stream_window_lengths()
+
+    ref_sess = ort.InferenceSession(ref_onnx_path, providers=["CPUExecutionProvider"])
+    sep_sess = ort.InferenceSession(sep_onnx_path, providers=["CPUExecutionProvider"])
+
+    mix_np = np.random.randn(1, int(t_audio)).astype(np.float32)
+    ref_rgb = np.random.randn(1, int(t_ref), int(image_size), int(image_size), 3).astype(np.float32)
+
+    gray = network_wrapper._video_rgb_to_gray(torch.from_numpy(ref_rgb)).numpy()
+    h = w = int(image_size)
+    if gray.shape[2] != h or gray.shape[3] != w:
+        b, t = gray.shape[0], gray.shape[1]
+        x = torch.from_numpy(gray).reshape(b * t, 1, gray.shape[2], gray.shape[3])
+        x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+        gray = x.reshape(b, t, h, w).numpy()
+
+    ref_feat = ref_sess.run(None, {"ref_gray": gray})[0]
+    split_out = sep_sess.run(None, {"mixture": mix_np, "ref_feat": ref_feat})[0]
+
+    if model is not None:
+        inner = getattr(model, "model", None)
+        if inner is not None and hasattr(inner, "sep_network"):
+            from models.av_mossformer2_tse.av_mossformer2 import encoder_frame_count
+
+            t_enc = encoder_frame_count(int(t_audio), 16)
+            inner.sep_network.decoder.set_fixed_ola_frames(t_enc)
+        with torch.no_grad():
+            pt_out = model(
+                torch.from_numpy(mix_np),
+                torch.from_numpy(ref_rgb),
+            ).numpy()
+        if pt_out.ndim == 3:
+            pt_out = pt_out.squeeze(1)
+        diff = np.abs(pt_out - split_out.squeeze()).max()
+        print(f"[split verify] max|full PyTorch - split ORT| = {diff:.6e}")
+        assert diff < 1e-4, f"split pipeline mismatch: {diff}"
+
+    from collections import Counter
+    import onnx
+
+    sep_m = onnx.load(sep_onnx_path)
+    ops = Counter(n.op_type for n in sep_m.graph.node)
+    print(
+        f"[split verify] sep ONNX: nodes={len(sep_m.graph.node)} "
+        f"ScatterElements={ops.get('ScatterElements', 0)} Einsum={ops.get('Einsum', 0)}"
+    )
 
 
 # ──────────────────────────── 主流程 ────────────────────────────
@@ -687,28 +777,11 @@ def main():
     parser.add_argument(
         "--infer_chunk_ms",
         type=float,
-        default=500.0,
+        default=200.0,
         help="流式 hop 时长（毫秒），定长 T_audio = context + hop + lookahead",
     )
     parser.add_argument("--lookahead_ms", type=float, default=0.0, help="流式前瞻窗口（毫秒）")
     parser.add_argument("--image_size", type=int, default=96, help="导出 dummy 的人脸尺寸")
-    parser.add_argument(
-        "--decoder_ola",
-        choices=("scatter", "conv", "gather_add"),
-        default="scatter",
-        help="decoder overlap-add: scatter (RKNN may fail), conv (ConvTranspose1d), gather_add (chunked Add)",
-    )
-    parser.add_argument(
-        "--export_part",
-        choices=("full", "sep", "decoder"),
-        default="full",
-        help="full=端到端; sep=encoder+separator(RKNN); decoder=仅 decoder(ORT/CPU)",
-    )
-    parser.add_argument(
-        "--ref_is_gray",
-        action="store_true",
-        help="ref 输入已经是 4D 灰度图 [B, T, H, W]，不需要在模型内部转灰度（用于 RKNN 部署，避免 5D op）",
-    )
     parser.add_argument("--skip_verify", action="store_true", help="跳过验证")
     parser.add_argument("--skip_quant", action="store_true", help="跳过静态 INT8 量化")
     parser.add_argument("--skip_fp16", action="store_true", help="跳过 FP16 转换")
@@ -719,6 +792,32 @@ def main():
     parser.add_argument("--n_calib", type=int, default=200, help="静态量化校准样本数 (默认 200)")
     parser.add_argument("--calib_wav", default=None, help="校准用音频文件路径")
     parser.add_argument("--calib_mp4", default=None, help="校准用视频文件路径")
+    parser.add_argument(
+        "--export_rknn_split",
+        action="store_true",
+        help="导出 RKNN 拆分图：ref_encoder (灰度4D) + sep (mixture+ref_feat)，不导出整图",
+    )
+    parser.add_argument(
+        "--ref_out",
+        default=os.path.join(ckpt_dir, "av_mossformer_ref_fixed.onnx"),
+        help="--export_rknn_split 时 ref_encoder ONNX 路径",
+    )
+    parser.add_argument(
+        "--sep_out",
+        default=os.path.join(ckpt_dir, "av_mossformer_sep_fixed.onnx"),
+        help="--export_rknn_split 时 separator ONNX（scatter OLA，ORT 精确）",
+    )
+    parser.add_argument(
+        "--sep_rknn_out",
+        default=os.path.join(ckpt_dir, "av_mossformer_sep_rknn.onnx"),
+        help="--export_rknn_split 时额外导出 ConvTranspose OLA 版（无 ScatterElements，供 RKNN）",
+    )
+    parser.add_argument(
+        "--ref_feat_channels",
+        type=int,
+        default=96,
+        help="ref_encoder 输出通道（与 config network_reference.emb_size 一致）",
+    )
     args = parser.parse_args()
     if args.fixed and args.fp32_out == default_fp32:
         args.fp32_out = default_fp32_fixed
@@ -773,6 +872,37 @@ def main():
                 image_size=int(args.image_size),
             )
 
+    elif args.export_rknn_split:
+        yaml_path = os.path.join(os.path.dirname(args.checkpoint), "config.yaml")
+        if not os.path.isfile(yaml_path):
+            yaml_path = os.path.join(ckpt_dir, "config.yaml")
+        cfg = load_config(yaml_path)
+        model = build_model(cfg, args.checkpoint)
+        t_audio_fixed, t_ref_fixed = export_rknn_split_onnx(
+            model,
+            args.ref_out,
+            args.sep_out,
+            args.opset,
+            audio_sr=int(args.audio_sr),
+            ref_sr=float(args.ref_sr),
+            context_ms=float(args.context_ms),
+            infer_chunk_ms=float(args.infer_chunk_ms),
+            lookahead_ms=float(args.lookahead_ms),
+            image_size=int(args.image_size),
+            ref_feat_channels=int(args.ref_feat_channels),
+            sep_rknn_out=args.sep_rknn_out,
+        )
+        if not args.skip_verify:
+            verify_rknn_split_onnx(
+                args.ref_out,
+                args.sep_out,
+                model,
+                t_audio=t_audio_fixed,
+                t_ref=t_ref_fixed,
+                image_size=int(args.image_size),
+                ref_feat_channels=int(args.ref_feat_channels),
+            )
+
     elif args.fp16_int8_only:
         # 只做 FP16+INT8：需已有 FP16 ONNX
         fp16_path = args.fp16_out
@@ -801,15 +931,7 @@ def main():
 
         # 1) 加载模型
         cfg = load_config(yaml_path)
-        base_model = build_model(cfg, args.checkpoint)
-        export_part = str(args.export_part)
-        ref_is_gray = bool(getattr(args, "ref_is_gray", False))
-        if export_part == "sep":
-            model = MossformerOnnxExport(base_model, export_part="sep", ref_is_gray=ref_is_gray)
-        elif export_part == "decoder":
-            model = MossformerDecoderOnnxExport(base_model)
-        else:
-            model = MossformerOnnxExport(base_model, export_part="full", ref_is_gray=ref_is_gray)
+        model = build_model(cfg, args.checkpoint)
 
         # 2) 导出 FP32 ONNX
         t_audio_fixed, t_ref_fixed = export_onnx(
@@ -823,9 +945,6 @@ def main():
             lookahead_ms=float(args.lookahead_ms),
             image_size=int(args.image_size),
             fixed=bool(args.fixed),
-            decoder_ola=str(args.decoder_ola),
-            export_part=export_part,
-            ref_is_gray=ref_is_gray,
         )
         if not args.skip_verify:
             verify(

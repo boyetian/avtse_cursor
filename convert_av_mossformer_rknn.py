@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Convert AV-Mossformer ONNX to RKNN with fixed mixture/ref shapes for RK3588."""
+"""Convert AV-Mossformer separator ONNX to RKNN (split deploy: ref_encoder on CPU/ORT).
+
+INT8 calibration pipeline (see scripts/build_rknn_sep_calib.py):
+  1) target_speaker_extraction_online/data/sample_2mix_calib_pairs.py --num 200
+  2) scripts/build_rknn_sep_calib.py --pairs-dir checkpoints/AV_Mossformer/rknn_calib_src_200
+  3) convert_av_mossformer_rknn.py --dtype i8 --dataset checkpoints/AV_Mossformer/rknn_calib_sep/dataset.txt
+"""
 
 from __future__ import annotations
 
@@ -8,12 +14,13 @@ import math
 import os
 import sys
 
+
 def _find_asr_scripts_dir() -> str:
     """Resolve asr_frontend/scripts whether this file lives under AV_TSE/ or av_tse/scripts/."""
     here = os.path.dirname(os.path.abspath(__file__))
     for rel in (
-        os.path.join("asr_frontend", "scripts"),              # AV_TSE/convert_*.py
-        os.path.join("..", "..", "asr_frontend", "scripts"),  # av_tse/scripts/convert_*.py
+        os.path.join("asr_frontend", "scripts"),
+        os.path.join("..", "..", "asr_frontend", "scripts"),
     ):
         cand = os.path.normpath(os.path.join(here, rel))
         if os.path.isfile(os.path.join(cand, "rknn_mem_guard.py")):
@@ -30,12 +37,12 @@ if _ASR_SCRIPTS not in sys.path:
 
 from rknn_mem_guard import require_avail_gb  # noqa: E402
 
-DEFAULT_ONNX = "./checkpoints/AV_Mossformer/av_mossformer2_fixed.onnx"
+DEFAULT_ONNX = "./checkpoints/AV_Mossformer/av_mossformer_sep_rknn.onnx"
+DEFAULT_REF_FEAT_CH = 96
 DEFAULT_AUDIO_SR = 16000
 DEFAULT_REF_SR = 30.0
 DEFAULT_CONTEXT_MS = 100.0
-DEFAULT_INFER_CHUNK_MS = 500.0
-DEFAULT_IMAGE_SIZE = 96
+DEFAULT_INFER_CHUNK_MS = 200.0
 
 
 def default_audio_len(
@@ -55,9 +62,32 @@ def default_ref_frames(audio_len: int, audio_sr: int, ref_sr: float, margin: int
     return max(2, frames + margin)
 
 
+def _onnx_input_shapes(onnx_path: str) -> dict:
+    import onnx
+
+    m = onnx.load(onnx_path)
+    shapes = {}
+    for inp in m.graph.input:
+        dims = []
+        for d in inp.type.tensor_type.shape.dim:
+            if d.dim_value > 0:
+                dims.append(int(d.dim_value))
+            else:
+                dims.append(-1)
+        shapes[inp.name] = dims
+    return shapes
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="AV-Mossformer ONNX -> RKNN")
-    parser.add_argument("--model", type=str, default=DEFAULT_ONNX, help="ONNX model path")
+    parser = argparse.ArgumentParser(
+        description="AV-Mossformer sep ONNX -> RKNN (ref_encoder stays on CPU/ORT)"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_ONNX,
+        help="Separator ONNX (export_onnx.py --export_rknn_split --sep_out ...)",
+    )
     parser.add_argument("--output_path", type=str, default="", help="Output .rknn path")
     parser.add_argument("--target", type=str, default="rk3588", help="RKNN target platform")
     parser.add_argument("--dtype", type=str, default="fp", choices=("fp", "i8"))
@@ -65,69 +95,42 @@ def main() -> int:
     parser.add_argument("--ref_sr", type=float, default=DEFAULT_REF_SR)
     parser.add_argument("--infer_chunk_ms", type=float, default=DEFAULT_INFER_CHUNK_MS)
     parser.add_argument("--context_ms", type=float, default=DEFAULT_CONTEXT_MS)
-    parser.add_argument("--audio_len", type=int, default=9600, help="Fixed mixture length (0=auto)")
-    parser.add_argument("--ref_frames", type=int, default=18, help="Fixed ref time dim (0=auto)")
-    parser.add_argument("--image_size", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument("--audio_len", type=int, default=4800, help="Fixed mixture length (0=auto)")
+    parser.add_argument("--ref_frames", type=int, default=9, help="Fixed ref_feat time dim (0=auto)")
+    parser.add_argument("--ref_feat_channels", type=int, default=DEFAULT_REF_FEAT_CH)
     parser.add_argument("--optimization_level", type=int, default=0)
-    parser.add_argument(
-        "--no_input_size",
-        action="store_true",
-        help="load_onnx without input_size_list (often reaches OpEmit; try if build aborts)",
-    )
-    parser.add_argument(
-        "--sep_only",
-        action="store_true",
-        help="ONNX has output sep_pack (export with --export_part sep)",
-    )
-    parser.add_argument(
-        "--ref_is_gray",
-        action="store_true",
-        help="ONNX ref input is 4D grayscale [B,T,H,W] (export with --ref_is_gray)",
-    )
     parser.add_argument("--min_avail_gb", type=float, default=36.0)
+    parser.add_argument("--verbose", action="store_true", help="RKNN verbose log")
     parser.add_argument(
-        "--single_core_mode",
+        "--allow_scatter",
         action="store_true",
-        default=True,
-        help="Build for single NPU core (reduces LayoutMatch work by 2/3)",
+        help="Allow ScatterElements in sep ONNX (default: require scatter-free conv export)",
     )
     parser.add_argument(
-        "--compress_weight",
+        "--ola_conv_export",
         action="store_true",
-        default=True,
-        help="Compress weights during build (reduces memory pressure)",
+        help="Hint: re-export sep with export_onnx.py --export_rknn_split and use_ola_conv (see export_sep_rknn_onnx)",
     )
     parser.add_argument(
-        "--remove_weight",
-        action="store_true",
-        default=True,
-        help="Remove weights from RKNN graph layout computation",
-    )
-    parser.add_argument(
-        "--remove_reshape",
-        action="store_true",
-        default=True,
-        help="DISABLE Reshape op optimization (LayoutMatch crash fix)",
-    )
-    parser.add_argument(
-        "--disable_reshape_rules",
-        action="store_true",
-        default=True,
-        help="Disable Reshape fusion rules to prevent ref tensor auto-fusion crash",
+        "--dataset",
+        type=str,
+        default="",
+        help="Calibration dataset.txt for --dtype i8 (scripts/build_rknn_sep_calib.py)",
     )
     args = parser.parse_args()
 
-    require_avail_gb(args.min_avail_gb, "AV-Mossformer RKNN")
+    require_avail_gb(args.min_avail_gb, "AV-Mossformer RKNN sep")
 
     audio_len = args.audio_len or default_audio_len(
         args.audio_sr, args.infer_chunk_ms, args.context_ms
     )
     ref_frames = args.ref_frames or default_ref_frames(audio_len, args.audio_sr, args.ref_sr)
-    h = w = args.image_size
+    ref_ch = int(args.ref_feat_channels)
 
     onnx_path = os.path.abspath(args.model)
     if not os.path.isfile(onnx_path):
         print(f"ONNX not found: {onnx_path}", file=sys.stderr)
+        print("Export first: python export_onnx.py --export_rknn_split", file=sys.stderr)
         return 1
 
     try:
@@ -137,47 +140,53 @@ def main() -> int:
         m = onnx.load(onnx_path)
         n_nodes = len(m.graph.node)
         ops = Counter(n.op_type for n in m.graph.node)
+        in_shapes = _onnx_input_shapes(onnx_path)
         print(
-            "[onnx check] nodes={} Einsum={} ScatterElements={} EyeLike={} ConvTranspose={} Resize={}".format(
+            "[onnx check] nodes={} inputs={} Einsum={} ScatterElements={} ConvTranspose={}".format(
                 n_nodes,
+                in_shapes,
                 ops.get("Einsum", 0),
                 ops.get("ScatterElements", 0),
-                ops.get("EyeLike", 0),
                 ops.get("ConvTranspose", 0),
-                ops.get("Resize", 0),
             ),
             flush=True,
         )
-        size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
-        if size_mb > 100:
+        if ops.get("ScatterElements", 0) > 0 and not args.allow_scatter:
             print(
-                f"[onnx check] WARN: ONNX file is {size_mb:.1f} MB (likely dense OLA matrix). "
-                "Re-export with scatter OLA (current av_mossformer2.py).",
+                "[onnx check] ERROR: ScatterElements in sep ONNX (decoder scatter OLA). "
+                "For RKNN use export_sep_rknn_onnx(..., use_ola_conv=True) then convert again, "
+                "or pass --allow_scatter to try scatter ONNX (often fails at build).",
+                file=sys.stderr,
                 flush=True,
             )
-        elif n_nodes > 50000:
+            return 1
+        if ops.get("ScatterElements", 0) > 0:
             print(
-                f"[onnx check] WARN: graph has {n_nodes} nodes (decoder loop unroll?). "
-                "Re-export with export_onnx.py --fixed.",
+                "[onnx check] WARN: ScatterElements present; RKNN build may fail (No lowering).",
                 flush=True,
             )
-        for n in m.graph.node:
-            if n.op_type == "ConvTranspose":
-                attrs = [a.name for a in n.attribute]
-                print(f"[onnx check] ConvTranspose attrs: {attrs}", flush=True)
-                break
+        if "ref" in in_shapes and "ref_feat" not in in_shapes:
+            print(
+                "[onnx check] ERROR: full-model ONNX (5D ref). Use av_mossformer_sep_fixed.onnx from --export_rknn_split.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
     except ImportError:
-        pass
+        in_shapes = {"mixture": [1, audio_len], "ref_feat": [1, ref_ch, ref_frames]}
+
+    if "ref_feat" in in_shapes:
+        rf = in_shapes["ref_feat"]
+        if len(rf) >= 3 and rf[1] > 0:
+            ref_ch = int(rf[1])
+        if len(rf) >= 3 and rf[2] > 0:
+            ref_frames = int(rf[2])
 
     out_path = args.output_path
     if not out_path:
         base, _ = os.path.splitext(onnx_path)
-        out_path = base + ".rknn"
+        out_path = base + ("_i8.rknn" if args.dtype == "i8" else ".rknn")
     out_path = os.path.abspath(out_path)
-
-    # Log file path
-    log_file = out_path.replace('.rknn', '_build.log')
-    print(f"--> logging to {log_file}", flush=True)
 
     try:
         from rknn.api import RKNN
@@ -185,66 +194,49 @@ def main() -> int:
         print("rknn-toolkit2 is required.", file=sys.stderr)
         return 1
 
-    rknn = RKNN(verbose=True, verbose_file=log_file)
+    rknn = RKNN(verbose=bool(args.verbose))
     print(
         f"--> config target={args.target} mixture=[1,{audio_len}] "
-        f"ref=[1,{ref_frames},{h},{w},3]",
+        f"ref_feat=[1,{ref_ch},{ref_frames}]",
         flush=True,
     )
     print(
-        f"--> ref_frames={ref_frames} must match ONNX export T_ref "
-        f"(export_onnx compute_stream_window_lengths)",
+        f"--> ref_encoder runs on CPU/ORT (gray ref); RKNN only compiles separator.",
         flush=True,
     )
-    disable_rules = None
-    if args.disable_reshape_rules:
-        disable_rules = [
-            "Remove_Useless_Reshape",
-            "Remove_Redundant_Slice",
-            "Fuse_Reshape_Into_Previous",
-            "Fuse_Reshape_Into_Next",
-            "Fuse_Slice_Into_Reshape",
-        ]
-    # Use optimization_level=-1 to disable ALL optimizations
     rknn.config(
         target_platform=args.target,
-        optimization_level=-1,
-        single_core_mode=args.single_core_mode,
+        optimization_level=args.optimization_level,
+        single_core_mode=True,
+        compress_weight=True,
     )
 
     print("--> load_onnx", onnx_path, flush=True)
-    load_kw = dict(model=onnx_path)
-    if not args.no_input_size:
-        load_kw["inputs"] = ["mixture", "ref"]
-        load_kw["input_size_list"] = [[1, audio_len], [1, ref_frames, h, w, 3] if not args.ref_is_gray else [1, ref_frames, h, w]]
-    if args.sep_only:
-        kernel_size = 16
-        stride = max(1, kernel_size // 2)
-        t_enc = (int(audio_len) - kernel_size) // stride + 1
-        n_ch = 512
-        try:
-            import onnx
-
-            m = onnx.load(onnx_path)
-            for vi in list(m.graph.input) + list(m.graph.value_info):
-                if "mixture_w" in vi.name and vi.type.tensor_type.shape.dim:
-                    for d in vi.type.tensor_type.shape.dim[1:2]:
-                        if d.dim_value:
-                            n_ch = int(d.dim_value)
-        except Exception:
-            pass
-        print(
-            f"[sep_only] ONNX output sep_pack; expect channels~{2 * n_ch}, T_enc={t_enc}",
-            flush=True,
-        )
-    ret = rknn.load_onnx(**load_kw)
+    ret = rknn.load_onnx(
+        model=onnx_path,
+        inputs=["mixture", "ref_feat"],
+        input_size_list=[[1, audio_len], [1, ref_ch, ref_frames]],
+    )
     if ret != 0:
         print("load_onnx failed", file=sys.stderr)
         return ret
     print("--> load_onnx done", flush=True)
 
-    print("--> build", flush=True)
-    ret = rknn.build(do_quantization=(args.dtype == "i8"))
+    do_quant = args.dtype == "i8"
+    if do_quant:
+        dataset = os.path.abspath(args.dataset) if args.dataset else ""
+        if not dataset or not os.path.isfile(dataset):
+            print(
+                "ERROR: --dtype i8 requires --dataset "
+                "(run: python scripts/build_rknn_sep_calib.py --wav ... --mp4 ...)",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"--> build (INT8) dataset={dataset}", flush=True)
+        ret = rknn.build(do_quantization=True, dataset=dataset)
+    else:
+        print("--> build (FP)", flush=True)
+        ret = rknn.build(do_quantization=False)
     if ret != 0:
         print("build failed", file=sys.stderr)
         return ret
@@ -257,7 +249,8 @@ def main() -> int:
         return ret
 
     print("done:", out_path)
-    print(f"  fixed audio_len={audio_len} ref_frames={ref_frames} image_size={h}")
+    print(f"  audio_len={audio_len} ref_feat=[1,{ref_ch},{ref_frames}]")
+    print(f"  pair with ORT: checkpoints/AV_Mossformer/av_mossformer_ref_fixed.onnx")
     return 0
 
 

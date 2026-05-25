@@ -1,7 +1,7 @@
 #pragma once
 
 #if defined(AV_TSE_USE_RKNN) && AV_TSE_USE_RKNN
-#include "av_tse/av_mossformer_rknn.hpp"
+#include "av_tse/av_mossformer_split.hpp"
 #else
 #include "av_tse/av_mossformer_onnx.hpp"
 #endif
@@ -14,7 +14,7 @@
 namespace av_tse {
 
 #if defined(AV_TSE_USE_RKNN) && AV_TSE_USE_RKNN
-using AvMossformerModel = AvMossformerRknn;
+using AvMossformerModel = AvMossformerSplit;
 #else
 using AvMossformerModel = AvMossformerOnnx;
 #endif

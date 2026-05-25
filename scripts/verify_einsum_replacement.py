@@ -219,28 +219,6 @@ def test_decoder_ola() -> None:
     _assert_close(got, ref, "Decoder scatter OLA vs ConvTranspose1d")
 
 
-def test_decoder_ola_gather_add() -> None:
-    from types import SimpleNamespace
-
-    torch.manual_seed(13)
-    L, N = 16, 64
-    args = SimpleNamespace()
-    dec = Decoder(args, N, L)
-    dec.eval()
-    t_frames = 120
-    dec.set_fixed_ola_frames(t_frames)
-    dec.set_ola_export_mode("gather_add", chunk_size=256)
-    x_bcl = torch.randn(1, L, t_frames)
-    with torch.no_grad():
-        x_flat = x_bcl.permute(0, 2, 1).reshape(1, t_frames * L)
-        ref_mode = "scatter"
-        dec._ola_export_mode = ref_mode
-        ref = dec._ola_synthesis(x_bcl)
-        dec.set_ola_export_mode("gather_add", chunk_size=256)
-        got = dec._ola_synthesis(x_bcl)
-    _assert_close(got, ref, "Decoder gather_add MatMul OLA vs scatter")
-
-
 def test_full_model() -> None:
     ckpt = os.path.join(ROOT, "checkpoints", "AV_Mossformer", "last_best_weights_only.pt")
     cfg_path = os.path.join(ROOT, "checkpoints", "AV_Mossformer", "config.yaml")
@@ -285,8 +263,6 @@ def main() -> int:
     print("[ok] RotaryEmbedding RKNN")
     test_decoder_ola()
     print("[ok] Decoder overlap-add")
-    test_decoder_ola_gather_add()
-    print("[ok] Decoder gather_add MatMul OLA")
     test_full_model()
     print("All RKNN-friendly op replacement checks passed.")
     return 0

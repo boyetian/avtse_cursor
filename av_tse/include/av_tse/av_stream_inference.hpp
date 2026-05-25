@@ -17,6 +17,8 @@ namespace av_tse {
 struct AVStreamInferenceOptions {
   std::string config_yaml;
   std::string onnx_path;
+  /// ORT ref_encoder (gray 4D); with rknn_path uses split deploy (ref CPU + sep NPU).
+  std::string ref_onnx_path;
   std::string rknn_path;
   int onnx_num_threads = 8;
   float context_ms = 100.f;

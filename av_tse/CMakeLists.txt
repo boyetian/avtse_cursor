@@ -397,7 +397,11 @@ endif()
 
 set(_av_tse_model_sources "")
 if(AV_TSE_INFERENCE_BACKEND STREQUAL "RKNN")
-  list(APPEND _av_tse_model_sources src/av_mossformer_rknn.cpp ../asr_frontend/src/rknn_session.cpp)
+  list(APPEND _av_tse_model_sources
+    src/av_mossformer_rknn.cpp
+    src/av_mossformer_ref_onnx.cpp
+    src/av_mossformer_split.cpp
+    ../asr_frontend/src/rknn_session.cpp)
 else()
   list(APPEND _av_tse_model_sources src/av_mossformer_onnx.cpp)
 endif()

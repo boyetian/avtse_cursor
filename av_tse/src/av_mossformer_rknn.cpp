@@ -1,7 +1,5 @@
 #include "av_tse/av_mossformer_rknn.hpp"
 
-#include "asr_frontend/rknn_session.hpp"
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -33,27 +31,23 @@ AvMossformerRknn::AvMossformerRknn(const std::string& rknn_path, int audio_len, 
   const rknn_tensor_attr& ref_attr = session_->input_attrs()[1];
 
   audio_len_ = audio_len > 0 ? audio_len : dimAt(mix_attr, 1, 9600);
-  ref_frames_ = ref_frames > 0 ? ref_frames : dimAt(ref_attr, 1, 20);
-  image_size_ = dimAt(ref_attr, 2, image_size);
-  const int ref_h = dimAt(ref_attr, 3, image_size_);
-  const int ref_w = dimAt(ref_attr, 4, image_size_);
-  channels_ = dimAt(ref_attr, 5, 3);
-  if (ref_h != image_size_ || ref_w != image_size_) {
-    throw std::runtime_error("AvMossformerRknn: ref H/W must match image_size from RKNN model");
+
+  if (ref_attr.n_dims >= 5) {
+    throw std::runtime_error(
+        "AvMossformerRknn: 5D RGB ref input not supported. Use AvMossformerSplit "
+        "(ORT ref_encoder + RKNN sep with ref_feat).");
   }
+
+  ref_feat_channels_ = dimAt(ref_attr, 1, 96);
+  ref_frames_ = ref_frames > 0 ? ref_frames : dimAt(ref_attr, 2, 18);
 }
 
-Eigen::VectorXf AvMossformerRknn::run(const Eigen::Ref<const Eigen::VectorXf>& mixture,
-                                      const std::vector<cv::Mat>& ref_frames) {
+Eigen::VectorXf AvMossformerRknn::runWithRefFeat(const Eigen::Ref<const Eigen::VectorXf>& mixture,
+                                                 const std::vector<float>& ref_feat) {
   const int T = static_cast<int>(mixture.size());
-  const int Tv = static_cast<int>(ref_frames.size());
-  if (T <= 0 || Tv <= 0) {
+  if (T <= 0) {
     return Eigen::VectorXf(0);
   }
-
-  const int H = image_size_;
-  const int W = image_size_;
-  const int C = channels_;
 
   std::vector<float> mix_flat(static_cast<size_t>(audio_len_), 0.f);
   const int copy_t = std::min(T, audio_len_);
@@ -61,23 +55,12 @@ Eigen::VectorXf AvMossformerRknn::run(const Eigen::Ref<const Eigen::VectorXf>& m
     mix_flat[static_cast<size_t>(t)] = mixture[t];
   }
 
-  std::vector<float> ref_flat(static_cast<size_t>(ref_frames_) * static_cast<size_t>(H) *
-                              static_cast<size_t>(W) * static_cast<size_t>(C),
-                            0.f);
-  const int copy_tv = std::min(Tv, ref_frames_);
-  for (int t = 0; t < copy_tv; ++t) {
-    const cv::Mat& f = ref_frames[static_cast<size_t>(t)];
-    if (f.rows != H || f.cols != W || f.channels() != C) {
-      throw std::runtime_error("ref frame shape mismatch");
-    }
-    for (int y = 0; y < H; ++y) {
-      for (int x = 0; x < W; ++x) {
-        const cv::Vec3f* row = f.ptr<cv::Vec3f>(y);
-        for (int c = 0; c < C; ++c) {
-          ref_flat[static_cast<size_t>(((t * H + y) * W + x) * C + c)] = row[x][c];
-        }
-      }
-    }
+  const size_t feat_elems =
+      static_cast<size_t>(ref_feat_channels_) * static_cast<size_t>(ref_frames_);
+  std::vector<float> feat_flat(feat_elems, 0.f);
+  const size_t copy_n = std::min(ref_feat.size(), feat_elems);
+  if (copy_n > 0) {
+    std::memcpy(feat_flat.data(), ref_feat.data(), copy_n * sizeof(float));
   }
 
   rknn_input inputs[2]{};
@@ -91,8 +74,8 @@ Eigen::VectorXf AvMossformerRknn::run(const Eigen::Ref<const Eigen::VectorXf>& m
   inputs[1].index = 1;
   inputs[1].type = session_->input_attrs()[1].type;
   inputs[1].fmt = session_->input_attrs()[1].fmt;
-  inputs[1].size = static_cast<uint32_t>(ref_flat.size() * sizeof(float));
-  inputs[1].buf = ref_flat.data();
+  inputs[1].size = static_cast<uint32_t>(feat_flat.size() * sizeof(float));
+  inputs[1].buf = feat_flat.data();
   inputs[1].pass_through = 0;
 
   std::vector<rknn_output> outputs(session_->io_num().n_output);
@@ -120,15 +103,19 @@ Eigen::VectorXf AvMossformerRknn::run(const Eigen::Ref<const Eigen::VectorXf>& m
     y[i] = out_ptr[i];
   }
 
-  rknn_outputs_release(session_->ctx(), static_cast<uint32_t>(outputs.size()), outputs.data());
-
-  if (out_t < T) {
-    Eigen::VectorXf padded(T);
-    padded.setZero();
-    padded.head(out_t) = y;
-    return padded;
+  for (auto& o : outputs) {
+    if (o.is_prealloc == 0 && o.buf != nullptr) {
+      free(o.buf);
+    }
   }
   return y;
+}
+
+Eigen::VectorXf AvMossformerRknn::run(const Eigen::Ref<const Eigen::VectorXf>& mixture,
+                                      const std::vector<cv::Mat>& ref_frames) {
+  (void)ref_frames;
+  throw std::runtime_error(
+      "AvMossformerRknn::run(frames) requires AvMossformerSplit with ref ONNX + RKNN sep");
 }
 
 }  // namespace av_tse

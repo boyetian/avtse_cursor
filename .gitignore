@@ -9,3 +9,9 @@ Miniforge3-Linux-x86_64.sh
 *.pt
 *.jpg
 *.pcm
+不需要上传/
+测试用例/
+测试结果/
+*.npy
+*.json
+

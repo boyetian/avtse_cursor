@@ -1,112 +1,12 @@
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
 import soundfile as sf
 
-from _pcm_to_wav import convert_pcm_to_wav
 from stream_inference_SDK import StreamInferenceSDK
-
-_AUDIO_EXTS = (".wav", ".pcm")
-
-
-def _norm_ext(path: str) -> str:
-    return os.path.splitext(path)[1].lower()
-
-
-def _resolve_output_dir(path: str) -> str:
-    """输出根路径：无 .wav 扩展名视为目录，否则取所在目录。"""
-    path = os.path.normpath(path)
-    if _norm_ext(path) == ".wav":
-        return os.path.dirname(path) or "."
-    return path
-
-
-def _resolve_av_inputs(
-    audio_input: str,
-    video_input: str,
-) -> List[Tuple[str, str, str, str]]:
-    """返回 [(stem, audio_path, ext, video_path), ...]。"""
-    audio_input = os.path.normpath(audio_input)
-    video_input = os.path.normpath(video_input)
-
-    if os.path.isdir(audio_input):
-        entries: dict[str, Tuple[str, str]] = {}
-        for name in sorted(os.listdir(audio_input)):
-            ext = _norm_ext(name)
-            if ext not in _AUDIO_EXTS:
-                continue
-            stem = os.path.splitext(name)[0]
-            path = os.path.join(audio_input, name)
-            prev = entries.get(stem)
-            if prev is None or prev[1] != ".pcm":
-                entries[stem] = (path, ext)
-        rows: List[Tuple[str, str, str, str]] = []
-        for stem, (audio_path, ext) in sorted(entries.items()):
-            if os.path.isdir(video_input):
-                video_path = os.path.join(video_input, stem + ".mp4")
-            elif os.path.isfile(video_input):
-                video_path = video_input
-            else:
-                raise FileNotFoundError(f"video path not found: {video_input}")
-            rows.append((stem, audio_path, ext, video_path))
-        return rows
-
-    if os.path.isfile(audio_input):
-        ext = _norm_ext(audio_input)
-        if ext not in _AUDIO_EXTS:
-            raise ValueError(f"unsupported audio extension: {ext}")
-        stem = os.path.splitext(os.path.basename(audio_input))[0]
-        if os.path.isdir(video_input):
-            video_path = os.path.join(video_input, stem + ".mp4")
-        elif os.path.isfile(video_input):
-            video_path = video_input
-        else:
-            raise FileNotFoundError(f"video path not found: {video_input}")
-        return [(stem, audio_input, ext, video_path)]
-
-    raise FileNotFoundError(f"audio path not found: {audio_input}")
-
-
-def _pcm_cache_path(cache_dir: str, stem: str, mode: str) -> str:
-    return os.path.join(cache_dir, f"{stem}_{mode}.wav")
-
-
-def _load_audio_for_inference(
-    audio_path: str,
-    ext: str,
-    *,
-    pcm_cache_dir: str,
-    pcm_sr: int,
-    pcm_dtype: str,
-    pcm_mode: str,
-) -> Tuple[np.ndarray, int]:
-    if ext == ".wav":
-        wav_file, sr_file = sf.read(audio_path, dtype="float32", always_2d=True)
-        return wav_file.T.astype(np.float32, copy=False), int(sr_file)
-
-    if ext != ".pcm":
-        raise ValueError(f"unsupported audio extension: {ext}")
-
-    stem = os.path.splitext(os.path.basename(audio_path))[0]
-    cache_wav = _pcm_cache_path(pcm_cache_dir, stem, pcm_mode)
-    os.makedirs(pcm_cache_dir, exist_ok=True)
-    need_convert = not os.path.isfile(cache_wav)
-    if not need_convert:
-        need_convert = os.path.getmtime(audio_path) > os.path.getmtime(cache_wav)
-    if need_convert:
-        convert_pcm_to_wav(
-            audio_path,
-            cache_wav,
-            sr=int(pcm_sr),
-            dtype=str(pcm_dtype),
-            mode=str(pcm_mode),
-        )
-        print(f"[pcm] {audio_path} -> {cache_wav}")
-    wav_file, sr_file = sf.read(cache_wav, dtype="float32", always_2d=True)
-    return wav_file.T.astype(np.float32, copy=False), int(sr_file)
 
 
 def _load_video_frames_bgr(mp4_path: str):
@@ -240,7 +140,7 @@ def main():
         default="torch",
         help="推理后端: torch, onnx(FP32), onnx_quant_dynamic(INT8), torch_jit, torch_jit_fp16",
     )
-    parser.add_argument("--infer_chunk_ms", type=float, default=500.0, help="推理hop时长(ms)")
+    parser.add_argument("--infer_chunk_ms", type=float, default=200.0, help="推理hop时长(ms)")
     parser.add_argument("--context_ms", type=float, default=100.0, help="左上下文时长(ms)")
     parser.add_argument("--max_history_ms", type=float, default=100.0, help="ring buffer最大历史(ms)")
     parser.add_argument("--use_stream_cache", type=int, default=1, help="1=full-buffer 推理, 0=逐 hop 滑窗")
@@ -254,6 +154,18 @@ def main():
         "--onnx_fixed",
         action="store_true",
         help="使用 checkpoints/AV_Mossformer/av_mossformer2_fixed.onnx（定长，与默认 infer_chunk_ms 对齐）",
+    )
+    parser.add_argument(
+        "--ref_onnx_path",
+        type=str,
+        default="",
+        help="RKNN 拆分部署：ORT ref_encoder（灰度 4D），与 --sep_onnx_path 同时使用",
+    )
+    parser.add_argument(
+        "--sep_onnx_path",
+        type=str,
+        default="",
+        help="RKNN 拆分部署：ORT separator（mixture+ref_feat），与 --ref_onnx_path 同时使用",
     )
     parser.add_argument(
         "--ts_path",
@@ -349,14 +261,6 @@ def main():
         default=0.15,
         help="锁定模式下与上一目标框 IoU 低于此值则不切换目标(保持上一帧)",
     )
-    parser.add_argument("--pcm-sr", type=int, default=16000, help="8ch PCM 采样率")
-    parser.add_argument("--pcm-dtype", default="int16", help="8ch PCM 原始类型 (int16/int32/float32)")
-    parser.add_argument(
-        "--pcm-mode",
-        default="clean",
-        choices=["clean", "noisy"],
-        help="8ch PCM 混音: clean=平均ch3-6, noisy=加权ch3-8",
-    )
     args = parser.parse_args()
     if args.bench_rtf:
         args.save_face_overlay_video_dir = ""
@@ -381,15 +285,22 @@ def main():
         overlay_scale=float(args.overlay_scale),
     )
     if args.type in ("onnx", "onnx_quant_dynamic"):
-        if args.onnx_path:
-            onnx_file = str(args.onnx_path)
-        elif args.onnx_fixed:
-            onnx_file = "checkpoints/AV_Mossformer/av_mossformer2_fixed.onnx"
-        elif args.type == "onnx_quant_dynamic":
-            onnx_file = "checkpoints/AV_Mossformer/av_mossformer2_quant_dynamic.onnx"
+        if args.ref_onnx_path and args.sep_onnx_path:
+            streamer = StreamInferenceSDK(
+                ref_onnx_path=str(args.ref_onnx_path),
+                sep_onnx_path=str(args.sep_onnx_path),
+                **sdk_kwargs,
+            )
         else:
-            onnx_file = "checkpoints/AV_Mossformer/av_mossformer2.onnx"
-        streamer = StreamInferenceSDK(onnx_path=onnx_file, **sdk_kwargs)
+            if args.onnx_path:
+                onnx_file = str(args.onnx_path)
+            elif args.onnx_fixed:
+                onnx_file = "checkpoints/AV_Mossformer/av_mossformer2_fixed.onnx"
+            elif args.type == "onnx_quant_dynamic":
+                onnx_file = "checkpoints/AV_Mossformer/av_mossformer2_quant_dynamic.onnx"
+            else:
+                onnx_file = "checkpoints/AV_Mossformer/av_mossformer2.onnx"
+            streamer = StreamInferenceSDK(onnx_path=onnx_file, **sdk_kwargs)
     elif args.type in ("torch_jit", "torch_jit_fp16"):
         if args.ts_path:
             ts_file = str(args.ts_path)
@@ -403,8 +314,7 @@ def main():
     else:
         streamer = StreamInferenceSDK(**sdk_kwargs)
 
-    # 可为输出目录（如 ./测试结果/av3）或占位 .wav 路径（取其 dirname）
-    out_wav = "./测试结果"
+    out_wav = "./测试结果/stream_sdk_main.wav"
 
     # 2a)和2b) 二选一，推荐2a)，2b) 仅供兜底使用
 
@@ -440,32 +350,39 @@ def main():
     '''
     audio_dir = "./测试用例/音频"
     video_dir = "./测试用例/视频"
-    out_dir = _resolve_output_dir(out_wav)
-    os.makedirs(out_dir, exist_ok=True)
-    pcm_cache_dir = os.path.join(out_dir, "_pcm_cache")
+    out_dir = os.path.dirname(out_wav)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-    av_tasks = _resolve_av_inputs(audio_dir, video_dir)
-    total_files = len(av_tasks)
-    if total_files == 0:
-        print("未找到可处理的 .wav / .pcm 文件")
-        return
+    if os.path.isdir(audio_dir):
+        audio_files = sorted([f for f in os.listdir(audio_dir) if f.endswith(".wav")])
+    elif os.path.isfile(audio_dir):
+        audio_files = [os.path.basename(audio_dir)]
+        audio_dir = os.path.dirname(audio_dir) or "."
+    else:
+        raise FileNotFoundError(f"audio path not found: {audio_dir}")
+    total_files = len(audio_files)
 
-    for idx, (base_name, audio_path, audio_ext, video_path) in enumerate(av_tasks):
+    for idx, audio_name in enumerate(audio_files):
+        base_name = os.path.splitext(audio_name)[0]
+        audio_path = os.path.join(audio_dir, audio_name)
+        if os.path.isdir(video_dir):
+            video_path = os.path.join(video_dir, base_name + ".mp4")
+        elif os.path.isfile(video_dir):
+            video_path = video_dir
+        else:
+            raise FileNotFoundError(f"video path not found: {video_dir}")
+
         if not os.path.exists(video_path):
-            print(f"跳过 {os.path.basename(audio_path)}：找不到对应视频 {video_path}")
+            print(f"跳过 {audio_name}：找不到对应视频 {video_path}")
             continue
 
         print(f"\n===== 处理 [{idx+1}/{total_files}]: {base_name} =====")
 
-        wav, sr = _load_audio_for_inference(
-            audio_path,
-            audio_ext,
-            pcm_cache_dir=pcm_cache_dir,
-            pcm_sr=int(args.pcm_sr),
-            pcm_dtype=str(args.pcm_dtype),
-            pcm_mode=str(args.pcm_mode),
-        )
+        wav_file, sr_file = sf.read(audio_path, dtype="float32", always_2d=True)  # [T,C]
+        wav = wav_file.T  # -> [C,T]
         frames, fps = _load_video_frames_bgr(video_path)
+        sr = int(sr_file)
 
         if args.save_face_video_dir:
             face_dir = str(args.save_face_video_dir)

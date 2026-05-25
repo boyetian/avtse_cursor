@@ -14,6 +14,7 @@ namespace av_tse {
 struct StreamInferenceSDKOptions {
   std::string config_yaml;
   std::string onnx_path;
+  std::string ref_onnx_path;
   std::string rknn_path;
   int onnx_num_threads = 8;
   /// SDK FIFO block duration (e.g. 500 in main.py).

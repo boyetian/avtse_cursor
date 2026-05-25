@@ -32,12 +32,6 @@ class Mossformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_normal_(p)
 
-    def forward_sep(self, mixture, visual):
-        """Encoder + separator only (for RKNN split export)."""
-        mixture_w = self.encoder(mixture)
-        est_mask = self.separator(mixture_w, visual)
-        return mixture_w, est_mask
-
     def forward(self, mixture, visual):
         st = getattr(self.args, "infer_forward_timing", None)
         if st is not None:
@@ -116,12 +110,6 @@ class Decoder(nn.Module):
         self.register_buffer("ola_col_idx", torch.zeros(0, dtype=torch.long), persistent=False)
         self._ola_out_len = 0
         self._ola_t_frames = 0
-        self._ola_export_mode = "scatter"
-        self._ola_chunk_size = 512
-
-    def set_ola_export_mode(self, mode: str, chunk_size: int = 512) -> None:
-        self._ola_export_mode = str(mode)
-        self._ola_chunk_size = max(1, int(chunk_size))
 
     def set_fixed_ola_frames(self, t_frames: int) -> None:
         """Pin OLA scatter indices for fixed-length export (small buffers, not dense MatMul weight)."""
@@ -132,27 +120,17 @@ class Decoder(nn.Module):
         self._ola_out_len = int(out_len)
         self._ola_t_frames = t_frames
 
-    def _ola_synthesis_matmul_chunks(self, x_flat: torch.Tensor) -> torch.Tensor:
-        """Chunked sparse OLA via MatMul (no ScatterElements; ~38 chunks at T_enc=1199)."""
-        out = x_flat.new_zeros(x_flat.size(0), self._ola_out_len)
-        nnz = int(self.ola_col_idx.numel())
-        chunk = int(self._ola_chunk_size)
-        out_len = int(self._ola_out_len)
-        for start in range(0, nnz, chunk):
-            end = min(start + chunk, nnz)
-            cols = self.ola_col_idx[start:end]
-            rows = self.ola_row_idx[start:end]
-            vals = x_flat[:, rows]
-            mat = torch.nn.functional.one_hot(cols, num_classes=out_len).to(dtype=x_flat.dtype)
-            out = out + torch.matmul(vals, mat)
-        return out
+    def clear_fixed_ola_frames(self) -> None:
+        """Use ConvTranspose OLA (RKNN-friendly, avoids ScatterElements from scatter_add)."""
+        self.register_buffer("ola_row_idx", torch.zeros(0, dtype=torch.long), persistent=False)
+        self.register_buffer("ola_col_idx", torch.zeros(0, dtype=torch.long), persistent=False)
+        self._ola_out_len = 0
+        self._ola_t_frames = 0
 
     def _ola_synthesis(self, x_bcl: torch.Tensor) -> torch.Tensor:
         b, L, t = x_bcl.shape
         if self.ola_row_idx.numel() > 0 and t == self._ola_t_frames:
             x_flat = x_bcl.permute(0, 2, 1).reshape(b, t * L)
-            if self._ola_export_mode == "gather_add":
-                return self._ola_synthesis_matmul_chunks(x_flat)
             out = x_flat.new_zeros(b, self._ola_out_len)
             col = self.ola_col_idx.unsqueeze(0).expand(b, -1)
             contrib = x_flat[:, self.ola_row_idx]
@@ -408,11 +386,6 @@ class av_mossformer2(nn.Module):
         )
         self._cached_ref = None
         self._cached_ref_len = 0
-
-    def forward_sep(self, mixture, ref):
-        """Ref encoder + encoder + mask (no decoder); stream cache disabled at export."""
-        ref = self.ref_encoder(ref)
-        return self.sep_network.forward_sep(mixture, ref)
 
     def forward(self, mixture, ref):
         st = getattr(self.args, "infer_forward_timing", None)

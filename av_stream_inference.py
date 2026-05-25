@@ -85,13 +85,6 @@ class _ONNXModelWrapper:
         if self.has_fixed_input:
             mix = self._fit_time_axis(mix, 1, int(self.fixed_t_audio))
             ref = self._fit_time_axis(ref, 1, int(self.fixed_t_ref))
-
-        # RKNN-friendly ONNX: ref is 4D grayscale, need to convert from 5D RGB
-        if self.normalize_mode == "mossformer" and ref.ndim == 5 and ref.shape[-1] == 3:
-            # Convert RGB to grayscale using same formula as the model
-            # ref shape: [B, T, H, W, 3] -> [B, T, H, W]
-            ref = 0.2989 * ref[..., 0] + 0.5870 * ref[..., 1] + 0.1140 * ref[..., 2]
-
         return mix, ref
 
     def __call__(self, mixture, ref):
@@ -119,100 +112,97 @@ class _ONNXModelWrapper:
         return self
 
 
-class _RKNNORTSplitModelWrapper:
-    """Split inference: RKNN runs separator (mixture+ref→sep_pack), ORT runs decoder.
+class _SplitOnnxModelWrapper:
+    """ORT ref_encoder (gray 4D) + ORT/RKNN sep (mixture + ref_feat). Matches training rgb_to_gray."""
 
-    RGB→grayscale conversion is done in CPU as preprocessing before feeding to RKNN.
-    """
-
-    def __init__(self, rknn_sep_path: str, decoder_onnx_path: str,
-                 audio_len: int = 9600, ref_frames: int = 18,
-                 image_size: int = 96, decoder_num_threads: int = 4):
-        from rknn.api import RKNN
+    def __init__(
+        self,
+        ref_onnx_path: str,
+        sep_onnx_path: str,
+        image_size: int = 96,
+        num_threads: int = 8,
+    ):
         import onnxruntime as ort
 
-        # Load RKNN separator model
-        self.rknn = RKNN(verbose=False)
-        ret = self.rknn.load_rknn(rknn_sep_path)
-        if ret != 0:
-            raise RuntimeError(f"load_rknn failed: {ret}")
-        ret = self.rknn.init_runtime(target=None)
-        if ret != 0:
-            raise RuntimeError(f"init_runtime failed: {ret}")
-        self.audio_len = int(audio_len)
-        self.ref_frames = int(ref_frames)
-        self.image_size = int(image_size)
-
-        # Load ORT decoder
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if decoder_num_threads > 0:
-            opts.intra_op_num_threads = decoder_num_threads
+        if num_threads > 0:
+            opts.intra_op_num_threads = num_threads
             opts.inter_op_num_threads = 1
-        self.decoder_sess = ort.InferenceSession(
-            decoder_onnx_path, sess_options=opts, providers=["CPUExecutionProvider"]
+        prov = ["CPUExecutionProvider"]
+        self.ref_sess = ort.InferenceSession(ref_onnx_path, sess_options=opts, providers=prov)
+        self.sep_sess = ort.InferenceSession(sep_onnx_path, sess_options=opts, providers=prov)
+        self.image_size = int(image_size)
+        self.fixed_t_audio: Optional[int] = None
+        self.fixed_t_ref: Optional[int] = None
+        for inp in self.sep_sess.get_inputs():
+            shape = list(inp.shape)
+            if inp.name == "mixture" and len(shape) >= 2:
+                self.fixed_t_audio = _onnx_dim_to_int(shape[1])
+            elif inp.name == "ref_feat" and len(shape) >= 3:
+                self.fixed_t_ref = _onnx_dim_to_int(shape[2])
+        self.has_fixed_input = (
+            self.fixed_t_audio is not None
+            and int(self.fixed_t_audio) > 0
+            and self.fixed_t_ref is not None
+            and int(self.fixed_t_ref) > 0
         )
-        # Read decoder input channel count from ONNX
-        self.n_ch = 512
-        for inp in self.decoder_sess.get_inputs():
-            if inp.name == "mixture_w" and len(inp.shape) >= 2:
-                ch = _onnx_dim_to_int(inp.shape[1])
-                if ch is not None and ch > 0:
-                    self.n_ch = int(ch)
-                    break
-        self.normalize_mode = "mossformer"
+        print(
+            f"[ONNX/split] ref_encoder + sep | fixed mixture [*, {self.fixed_t_audio}], "
+            f"ref_feat [*, C, {self.fixed_t_ref}]"
+        )
 
     @staticmethod
-    def _fit_time_axis(arr: np.ndarray, axis: int, target_len: int) -> np.ndarray:
-        cur = int(arr.shape[axis])
-        tgt = int(target_len)
-        if cur == tgt:
-            return arr.astype(np.float32, copy=False)
-        if cur > tgt:
-            sl = [slice(None)] * arr.ndim
-            sl[axis] = slice(0, tgt)
-            return arr[tuple(sl)].astype(np.float32, copy=False)
-        pad_width = [(0, 0)] * arr.ndim
-        pad_width[axis] = (0, tgt - cur)
-        return np.pad(arr.astype(np.float32, copy=False), pad_width, mode="constant")
+    def _rgb_to_gray_np(ref_bt_hwc: np.ndarray) -> np.ndarray:
+        """[B,T,H,W,3] -> [B,T,H,W], same coeffs as networks.network_wrapper."""
+        x = ref_bt_hwc.astype(np.float32, copy=False)
+        return (
+            0.2989 * x[..., 0] + 0.5870 * x[..., 1] + 0.1140 * x[..., 2]
+        ).astype(np.float32, copy=False)
 
-    def _prepare_inputs(self, mixture_np: np.ndarray, ref_np: np.ndarray):
-        mix = np.asarray(mixture_np, dtype=np.float32)
+    def _prepare_gray_ref(self, ref_np: np.ndarray) -> np.ndarray:
         ref = np.asarray(ref_np, dtype=np.float32)
-        # Fit to fixed lengths
-        if self.audio_len > 0:
-            mix = self._fit_time_axis(mix, 1, self.audio_len)
-        if self.ref_frames > 0:
-            ref = self._fit_time_axis(ref, 1, self.ref_frames)
-        # RGB→grayscale if 5D input
-        if self.normalize_mode == "mossformer" and ref.ndim == 5 and ref.shape[-1] == 3:
-            ref = 0.2989 * ref[..., 0] + 0.5870 * ref[..., 1] + 0.1140 * ref[..., 2]
-        return mix, ref
+        if ref.ndim == 5:
+            gray = self._rgb_to_gray_np(ref)
+        elif ref.ndim == 4:
+            gray = ref
+        else:
+            raise ValueError(f"ref must be [B,T,H,W,3] or [B,T,H,W], got {ref.shape}")
+        h = w = self.image_size
+        if gray.shape[2] != h or gray.shape[3] != w:
+            b, t = gray.shape[0], gray.shape[1]
+            resized = np.zeros((b, t, h, w), dtype=np.float32)
+            for bi in range(b):
+                for ti in range(t):
+                    resized[bi, ti] = cv2.resize(
+                        gray[bi, ti], (w, h), interpolation=cv2.INTER_AREA
+                    )
+            gray = resized
+        if self.has_fixed_input:
+            gray = _ONNXModelWrapper._fit_time_axis(gray, 1, int(self.fixed_t_ref))
+        return gray
+
+    def _run_sep(self, mixture_np: np.ndarray, ref_feat: np.ndarray) -> np.ndarray:
+        mix = np.asarray(mixture_np, dtype=np.float32)
+        if self.has_fixed_input:
+            mix = _ONNXModelWrapper._fit_time_axis(mix, 1, int(self.fixed_t_audio))
+            ref_feat = _ONNXModelWrapper._fit_time_axis(ref_feat, 2, int(self.fixed_t_ref))
+        return self.sep_sess.run(None, {"mixture": mix, "ref_feat": ref_feat})[0]
 
     def __call__(self, mixture, ref):
         if isinstance(mixture, torch.Tensor):
             mixture = mixture.numpy()
         if isinstance(ref, torch.Tensor):
             ref = ref.numpy()
-        return torch.from_numpy(self.call_numpy(mixture, ref))
+        gray = self._prepare_gray_ref(ref)
+        ref_feat = self.ref_sess.run(None, {"ref_gray": gray})[0]
+        out = self._run_sep(mixture, ref_feat)
+        return torch.from_numpy(out)
 
-    def call_numpy(self, mixture_np: np.ndarray, ref_np: np.ndarray) -> np.ndarray:
-        mix, ref_gray = self._prepare_inputs(mixture_np, ref_np)
-        # RKNN separator: mixture + ref_gray → sep_pack
-        sep_pack = self.rknn.inference(inputs=[mix, ref_gray])[0]
-        # Split sep_pack into mixture_w and est_mask along channel axis
-        n_ch = self.n_ch
-        mixture_w = sep_pack[:, :n_ch, :]
-        est_mask = sep_pack[:, n_ch:, :]
-        # ORT decoder
-        t_audio = np.array([int(mix.shape[1])], dtype=np.int64)
-        out = self.decoder_sess.run(
-            None,
-            {"mixture_w": mixture_w.astype(np.float32),
-             "est_mask": est_mask.astype(np.float32),
-             "target_audio_len": t_audio}
-        )
-        return out[0].squeeze(0)
+    def call_numpy(self, mixture_np, ref_np):
+        gray = self._prepare_gray_ref(ref_np)
+        ref_feat = self.ref_sess.run(None, {"ref_gray": gray})[0]
+        return self._run_sep(mixture_np, ref_feat)
 
     def clear_stream_cache(self):
         pass
@@ -1030,13 +1020,10 @@ class AVStreamInference:
         lookahead_frames: int = 0,
         cpu_threads: int = 8,
         onnx_path: Optional[str] = None,
+        ref_onnx_path: Optional[str] = None,
+        sep_onnx_path: Optional[str] = None,
         onnx_num_threads: int = 8,
         ts_path: Optional[str] = None,
-        rknn_sep_path: Optional[str] = None,
-        decoder_onnx_path: Optional[str] = None,
-        rknn_audio_len: int = 9600,
-        rknn_ref_frames: int = 18,
-        decoder_num_threads: int = 4,
         face_crop_size: int = 96,
         face_scale: float = 0.8,
         face_detect_every_n: int = 5,
@@ -1135,9 +1122,14 @@ class AVStreamInference:
         encoder_stride = max(1, encoder_stride)
         self.drop_unit_enc = max(1, self.drop_unit_samples // encoder_stride)
 
-        if onnx_path:
-            self.backend_kind = "onnx"
-            self.model = _ONNXModelWrapper(onnx_path, num_threads=int(onnx_num_threads))
+        if ref_onnx_path and sep_onnx_path:
+            self.backend_kind = "onnx_split"
+            self.model = _SplitOnnxModelWrapper(
+                ref_onnx_path,
+                sep_onnx_path,
+                image_size=self.image_size,
+                num_threads=int(onnx_num_threads),
+            )
             if int(ingress_warmup) != 0:
                 _warmup_ingress_forward(
                     self.model,
@@ -1149,18 +1141,9 @@ class AVStreamInference:
                     self.context_samples,
                     self.lookahead_samples,
                 )
-        elif rknn_sep_path:
-            self.backend_kind = "rknn_split"
-            self.model = _RKNNORTSplitModelWrapper(
-                rknn_sep_path=rknn_sep_path,
-                decoder_onnx_path=decoder_onnx_path or os.path.join(
-                    str(checkpoint_dir), "av_mossformer2_decoder_fixed.onnx"
-                ),
-                audio_len=int(rknn_audio_len),
-                ref_frames=int(rknn_ref_frames),
-                image_size=int(self.image_size),
-                decoder_num_threads=int(decoder_num_threads),
-            )
+        elif onnx_path:
+            self.backend_kind = "onnx"
+            self.model = _ONNXModelWrapper(onnx_path, num_threads=int(onnx_num_threads))
             if int(ingress_warmup) != 0:
                 _warmup_ingress_forward(
                     self.model,
@@ -1194,6 +1177,16 @@ class AVStreamInference:
             ckpt_default = os.path.join(str(checkpoint_dir), "last_best_checkpoint.pt")
             ckpt = ckpt_weights_only if os.path.isfile(ckpt_weights_only) else ckpt_default
             _load_model_weights(self.model, ckpt)
+            if self.backbone == "av_mossformer2_tse" and hasattr(self.model, "model"):
+                from models.av_mossformer2_tse.av_mossformer2 import encoder_frame_count
+
+                t_enc = encoder_frame_count(
+                    self.hop_samples + self.context_samples + self.lookahead_samples,
+                    int(getattr(self.ns.network_audio, "encoder_kernel_size", 16)),
+                )
+                dec = getattr(self.model.model.sep_network, "decoder", None)
+                if dec is not None and hasattr(dec, "set_fixed_ola_frames"):
+                    dec.set_fixed_ola_frames(t_enc)
             if int(ingress_warmup) != 0:
                 _warmup_ingress_forward(
                     self.model,
