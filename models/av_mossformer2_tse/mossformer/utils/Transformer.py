@@ -166,8 +166,6 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self.shift_tokens = shift_tokens
         self.rotary_pos_emb = rotary_pos_emb
         self.dropout = nn.Dropout(dropout)
-        self._rknn_safe = False
-        self.register_buffer("_rknn_inv_g_weight", torch.zeros(0), persistent=False)
 
         self.to_hidden = FFConvM(
             dim_in=dim, dim_out=hidden_dim, norm_klass=norm_klass, dropout=dropout, causal=causal
@@ -180,12 +178,6 @@ class FLASH_ShareA_FFConvM(nn.Module):
             dim_in=dim * 2, dim_out=dim, norm_klass=norm_klass, dropout=dropout, causal=causal
         )
         self.gateActivate = nn.Sigmoid()
-
-    def enable_rknn_safe(self, num_groups: int):
-        """Replace scalar Div(/ g) with depthwise Conv2d for RKNN export."""
-        self._rknn_safe = True
-        with torch.no_grad():
-            self._rknn_inv_g_weight = (1.0 / self.group_size) * torch.ones(num_groups, 1, 1, 1)
 
     def forward(self, x, mask=None):
         normed_x = x
@@ -229,16 +221,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
         if exists(mask):
             mask = rearrange(mask, "b (g j) -> b g 1 j", j=g)
 
-        sim = torch.matmul(quad_q, quad_k.transpose(-1, -2))
-        if self._rknn_safe:
-            sim = F.conv2d(sim, self._rknn_inv_g_weight, groups=self._rknn_inv_g_weight.shape[0])
-        else:
-            sim = sim / g
-        attn = F.relu(sim)
-        if self._rknn_safe:
-            attn = attn * attn
-        else:
-            attn = attn ** 2
+        sim = torch.matmul(quad_q, quad_k.transpose(-1, -2)) / g
+        attn = F.relu(sim) ** 2
         attn = self.dropout(attn)
 
         if exists(mask):
@@ -252,20 +236,12 @@ class FLASH_ShareA_FFConvM(nn.Module):
         quad_out_u = torch.matmul(attn, u)
 
         if self.causal:
-            lin_kv = torch.matmul(lin_k.transpose(-2, -1), v)
-            if self._rknn_safe:
-                lin_kv = F.conv2d(lin_kv, self._rknn_inv_g_weight, groups=self._rknn_inv_g_weight.shape[0])
-            else:
-                lin_kv = lin_kv / g
+            lin_kv = torch.matmul(lin_k.transpose(-2, -1), v) / g
             lin_kv = lin_kv.cumsum(dim=1)
             lin_kv = _shift_left_one(lin_kv, dim=1)
             lin_out_v = torch.matmul(lin_q, lin_kv)
 
-            lin_ku = torch.matmul(lin_k.transpose(-2, -1), u)
-            if self._rknn_safe:
-                lin_ku = F.conv2d(lin_ku, self._rknn_inv_g_weight, groups=self._rknn_inv_g_weight.shape[0])
-            else:
-                lin_ku = lin_ku / g
+            lin_ku = torch.matmul(lin_k.transpose(-2, -1), u) / g
             lin_ku = lin_ku.cumsum(dim=1)
             lin_ku = _shift_left_one(lin_ku, dim=1)
             lin_out_u = torch.matmul(lin_q, lin_ku)

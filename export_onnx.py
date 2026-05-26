@@ -27,10 +27,6 @@ import torch.nn.functional as F
 import yaml
 
 from networks import network_wrapper
-from models.av_mossformer2_tse.av_mossformer2 import encoder_frame_count
-from models.av_mossformer2_tse.mossformer.utils.normalization import ScaleNorm
-from models.av_mossformer2_tse.mossformer.utils.one_path_flash_fsmn import ScaledSinuEmbedding
-from models.av_mossformer2_tse.mossformer.utils.Transformer import FLASH_ShareA_FFConvM
 
 
 def _dict_to_ns(d):
@@ -124,44 +120,6 @@ def _use_decoder_ola_conv_for_export(model) -> None:
     print("[export] decoder OLA: ConvTranspose (RKNN sep, no ScatterElements)")
 
 
-def _prepare_rknn_scalar_safe(model, t_audio: int, kernel_size: int = 16) -> None:
-    """Enable RKNN-safe scalar replacements in the separator network.
-
-    Replaces scalar Mul/Div with depthwise Conv1d/Conv2d to avoid
-    REGTASK bit-width overflow when flattened elements > 8191.
-    Must be called AFTER checkpoint loading, BEFORE ONNX tracing.
-    """
-    inner = getattr(model, "model", None)
-    if inner is None:
-        return
-    sep = getattr(inner, "sep_network", None)
-    if sep is None:
-        return
-
-    t_enc = encoder_frame_count(int(t_audio), int(kernel_size))
-
-    group_size = 256
-    for m in sep.modules():
-        if isinstance(m, FLASH_ShareA_FFConvM):
-            group_size = m.group_size
-            break
-    num_groups = (t_enc + group_size - 1) // group_size
-
-    count = 0
-    for m in sep.modules():
-        if isinstance(m, ScaleNorm):
-            m.enable_rknn_safe()
-            count += 1
-        elif isinstance(m, ScaledSinuEmbedding):
-            m.enable_rknn_safe()
-            count += 1
-        elif isinstance(m, FLASH_ShareA_FFConvM):
-            m.enable_rknn_safe(num_groups)
-            count += 1
-    print(f"[export] RKNN scalar-safe: enabled on {count} modules "
-          f"(T_enc={t_enc}, group_size={group_size}, num_groups={num_groups})")
-
-
 class RefEncoderOnnxWrapper(nn.Module):
     """Gray lip video [B,T,H,W] -> ref_feat [B,C,T] for ORT on CPU."""
 
@@ -239,7 +197,6 @@ def export_sep_rknn_onnx(
     else:
         _pin_decoder_ola_for_export(model, t_audio)
         print("[export] decoder OLA: scatter_add (matches training; ScatterElements in ONNX)")
-    _prepare_rknn_scalar_safe(model, t_audio)
     wrap = SepOnnxWrapper(inner.sep_network).eval()
     dummy_mix = torch.randn(1, int(t_audio), dtype=torch.float32)
     dummy_feat = torch.randn(1, int(ref_feat_channels), int(t_ref), dtype=torch.float32)
