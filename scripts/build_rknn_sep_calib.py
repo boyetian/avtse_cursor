@@ -7,9 +7,11 @@ Pipeline:
        python data/sample_2mix_calib_pairs.py --num 200 \\
          --out-dir ../AV_TSE/checkpoints/AV_Mossformer/rknn_calib_src_200
   2) Build calibration npy + dataset.txt (this script; MediaPipe lip crop like main.py):
+       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \\
        python scripts/build_rknn_sep_calib.py \\
          --pairs-dir checkpoints/AV_Mossformer/rknn_calib_src_200 \\
          --max-samples 200 \\
+         --workers 48 --ort-intra-threads 1 \\
          --preview-dir checkpoints/AV_Mossformer/rknn_calib_preview \\
          --preview-max 20
   3) Convert to RKNN INT8 (RKNN-Toolkit2 env):
@@ -23,9 +25,11 @@ import argparse
 import glob
 import math
 import os
+import re
 import sys
-from dataclasses import dataclass
-from typing import Optional
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass
+from typing import Any, Optional
 
 import numpy as np
 
@@ -36,6 +40,7 @@ if _ROOT not in sys.path:
 # Match av_stream_inference.IncrementalVideoResampler (mossformer path)
 MOSSFORMER_MEAN = 0.506362
 MOSSFORMER_STD = 0.272877
+_MIX_IDX_RE = re.compile(r"mix_(\d+)\.npy", re.IGNORECASE)
 
 
 @dataclass
@@ -53,6 +58,69 @@ class VideoPreprocessConfig:
     face_target_policy: str = "center_largest"
     face_target_lock: bool = True
     face_target_lock_min_iou: float = 0.15
+
+
+@dataclass
+class PairJob:
+    pair_id: int
+    wav_path: str
+    mp4_path: str
+    ref_onnx: str
+    out_dir: str
+    budget: int
+    start_idx: int
+    audio_len: int
+    ref_frames: int
+    vcfg_dict: dict
+    audio_sr: int
+    preview_dir: str
+    preview_budget: int
+    ort_intra_threads: int
+    preview_shared: Optional[tuple[Any, Any]] = None
+
+
+@dataclass
+class PairResult:
+    pair_id: int
+    written: int
+    lines: list[str]
+    skipped: bool
+    error: str = ""
+
+
+def _limit_cpu_threads(num: int = 1) -> None:
+    n = str(max(1, int(num)))
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ.setdefault(key, n)
+
+
+def _create_ref_session(ref_onnx: str, intra_threads: int = 1):
+    import onnxruntime as ort
+
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = max(1, int(intra_threads))
+    opts.inter_op_num_threads = 1
+    return ort.InferenceSession(
+        ref_onnx,
+        sess_options=opts,
+        providers=["CPUExecutionProvider"],
+    )
+
+
+def _sample_index_from_dataset_line(line: str) -> int:
+    part = line.strip().split()[0]
+    m = _MIX_IDX_RE.search(os.path.basename(part))
+    return int(m.group(1)) if m else -1
+
+
+def _sort_dataset_lines(lines: list[str]) -> list[str]:
+    return sorted(lines, key=_sample_index_from_dataset_line)
 
 
 def _compute_stream_window_lengths(
@@ -309,6 +377,7 @@ def build_from_av(
     start_idx: int = 0,
     preview_dir: str = "",
     preview_budget: int = 0,
+    preview_shared: Optional[tuple[Any, Any]] = None,
 ) -> tuple[int, list[str], int]:
     wav = _load_mono_wav(wav_path, audio_sr)
 
@@ -361,18 +430,28 @@ def build_from_av(
         out_idx = start_idx + written
         _write_sample(out_dir, out_idx, mix, ref_feat, lines)
 
-        if preview_dir and previews_left > 0:
-            lip_window = np.stack(lip_list[v0 : v0 + ref_frames], axis=0)
-            _write_preview_clip(
-                preview_dir,
-                out_idx,
-                lip_window,
-                gray,
-                mix[0],
-                vcfg.ref_sr,
-                audio_sr,
-            )
-            previews_left -= 1
+        if preview_dir:
+            do_preview = False
+            if preview_shared is not None:
+                preview_left, preview_lock = preview_shared
+                with preview_lock:
+                    if int(preview_left.value) > 0:
+                        preview_left.value = int(preview_left.value) - 1
+                        do_preview = True
+            elif previews_left > 0:
+                do_preview = True
+                previews_left -= 1
+            if do_preview:
+                lip_window = np.stack(lip_list[v0 : v0 + ref_frames], axis=0)
+                _write_preview_clip(
+                    preview_dir,
+                    out_idx,
+                    lip_window,
+                    gray,
+                    mix[0],
+                    vcfg.ref_sr,
+                    audio_sr,
+                )
         written += 1
 
     return written, lines, previews_left
@@ -390,10 +469,98 @@ def _discover_pairs(pairs_dir: str, prefix: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def _plan_pair_jobs(
+    pairs: list[tuple[str, str]],
+    max_samples: int,
+    ref_onnx: str,
+    out_dir: str,
+    audio_len: int,
+    ref_frames: int,
+    vcfg: VideoPreprocessConfig,
+    audio_sr: int,
+    preview_dir: str,
+    preview_max: int,
+    ort_intra_threads: int,
+    preview_shared: Optional[tuple[Any, Any]] = None,
+) -> list[PairJob]:
+    per_pair_cap = (
+        max(1, (max_samples + len(pairs) - 1) // len(pairs)) if max_samples > 0 else 10**9
+    )
+    jobs: list[PairJob] = []
+    budget_allocated = 0
+    for pair_id, (wav_path, mp4_path) in enumerate(pairs):
+        if max_samples > 0 and budget_allocated >= max_samples:
+            break
+        budget = per_pair_cap
+        if max_samples > 0:
+            budget = min(budget, max_samples - budget_allocated)
+        jobs.append(
+            PairJob(
+                pair_id=pair_id,
+                wav_path=wav_path,
+                mp4_path=mp4_path,
+                ref_onnx=ref_onnx,
+                out_dir=out_dir,
+                budget=budget,
+                start_idx=budget_allocated,
+                audio_len=audio_len,
+                ref_frames=ref_frames,
+                vcfg_dict=asdict(vcfg),
+                audio_sr=audio_sr,
+                preview_dir=preview_dir,
+                preview_budget=preview_max if preview_dir and preview_shared is None else 0,
+                ort_intra_threads=ort_intra_threads,
+                preview_shared=preview_shared,
+            )
+        )
+        budget_allocated += budget
+    return jobs
+
+
+def _process_pair_job(job: PairJob) -> PairResult:
+    _limit_cpu_threads(1)
+    vcfg = VideoPreprocessConfig(**job.vcfg_dict)
+    try:
+        ref_sess = _create_ref_session(job.ref_onnx, intra_threads=job.ort_intra_threads)
+        n, chunk_lines, _ = build_from_av(
+            job.wav_path,
+            job.mp4_path,
+            ref_sess,
+            job.out_dir,
+            job.budget,
+            job.audio_len,
+            job.ref_frames,
+            vcfg,
+            job.audio_sr,
+            start_idx=job.start_idx,
+            preview_dir=job.preview_dir,
+            preview_budget=job.preview_budget,
+            preview_shared=job.preview_shared,
+        )
+        if n <= 0:
+            return PairResult(
+                pair_id=job.pair_id,
+                written=0,
+                lines=[],
+                skipped=True,
+                error="no valid chunks",
+            )
+        return PairResult(pair_id=job.pair_id, written=n, lines=chunk_lines, skipped=False)
+    except (RuntimeError, FileNotFoundError) as e:
+        print(f"[calib] skip {os.path.basename(job.wav_path)}: {e}", flush=True)
+        return PairResult(
+            pair_id=job.pair_id,
+            written=0,
+            lines=[],
+            skipped=True,
+            error=str(e),
+        )
+
+
 def build_from_pairs_dir(
     pairs_dir: str,
     pairs_prefix: str,
-    ref_sess,
+    ref_onnx: str,
     out_dir: str,
     max_samples: int,
     audio_len: int,
@@ -402,51 +569,93 @@ def build_from_pairs_dir(
     audio_sr: int,
     preview_dir: str = "",
     preview_max: int = 0,
+    workers: int = 1,
+    ort_intra_threads: int = 1,
+    ref_sess=None,
 ) -> tuple[int, list[str]]:
     pairs = _discover_pairs(pairs_dir, pairs_prefix)
     if not pairs:
         raise RuntimeError(f"no {pairs_prefix}_*.wav + .mp4 under {pairs_dir}")
-    print(f"[calib] pairs-dir: {len(pairs)} files under {pairs_dir}")
+    workers = max(1, int(workers))
+    print(f"[calib] pairs-dir: {len(pairs)} files under {pairs_dir} workers={workers}")
+
+    preview_shared = None
+    manager = None
+    if preview_dir and workers > 1 and preview_max > 0:
+        import multiprocessing
+
+        manager = multiprocessing.Manager()
+        preview_shared = (manager.Value("i", int(preview_max)), manager.Lock())
+
+    jobs = _plan_pair_jobs(
+        pairs,
+        max_samples,
+        ref_onnx,
+        out_dir,
+        audio_len,
+        ref_frames,
+        vcfg,
+        audio_sr,
+        preview_dir,
+        preview_max,
+        ort_intra_threads,
+        preview_shared=preview_shared,
+    )
 
     lines: list[str] = []
     written = 0
-    previews_left = preview_max if preview_dir else 0
-    per_pair_cap = (
-        max(1, (max_samples + len(pairs) - 1) // len(pairs)) if max_samples > 0 else 10**9
-    )
     skipped = 0
-    for wav_path, mp4_path in pairs:
-        if max_samples > 0 and written >= max_samples:
-            break
-        budget = per_pair_cap
-        if max_samples > 0:
-            budget = min(budget, max_samples - written)
-        try:
-            n, chunk_lines, previews_left = build_from_av(
-                wav_path,
-                mp4_path,
-                ref_sess,
-                out_dir,
-                budget,
-                audio_len,
-                ref_frames,
-                vcfg,
-                audio_sr,
-                start_idx=written,
-                preview_dir=preview_dir,
-                preview_budget=previews_left,
-            )
-        except (RuntimeError, FileNotFoundError) as e:
-            print(f"[calib] skip {os.path.basename(wav_path)}: {e}", flush=True)
-            skipped += 1
-            continue
-        if n <= 0:
-            skipped += 1
-            continue
-        lines.extend(chunk_lines)
-        written += n
+
+    if workers <= 1:
+        if ref_sess is None:
+            ref_sess = _create_ref_session(ref_onnx, intra_threads=ort_intra_threads)
+        previews_left = preview_max if preview_dir else 0
+        for job in jobs:
+            if max_samples > 0 and written >= max_samples:
+                break
+            budget = job.budget
+            if max_samples > 0:
+                budget = min(budget, max_samples - written)
+            try:
+                n, chunk_lines, previews_left = build_from_av(
+                    job.wav_path,
+                    job.mp4_path,
+                    ref_sess,
+                    out_dir,
+                    budget,
+                    audio_len,
+                    ref_frames,
+                    vcfg,
+                    audio_sr,
+                    start_idx=written,
+                    preview_dir=preview_dir,
+                    preview_budget=previews_left,
+                )
+            except (RuntimeError, FileNotFoundError) as e:
+                print(f"[calib] skip {os.path.basename(job.wav_path)}: {e}", flush=True)
+                skipped += 1
+                continue
+            if n <= 0:
+                skipped += 1
+                continue
+            lines.extend(chunk_lines)
+            written += n
+    else:
+        _limit_cpu_threads(1)
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(_process_pair_job, jobs, chunksize=1))
+        for res in results:
+            if res.skipped:
+                skipped += 1
+                continue
+            lines.extend(res.lines)
+            written += res.written
+        if manager is not None:
+            manager.shutdown()
+
     if skipped:
         print(f"[calib] skipped {skipped} pair(s) (no valid chunks or IO error)", flush=True)
+    lines = _sort_dataset_lines(lines)
     return written, lines
 
 
@@ -562,6 +771,18 @@ def main() -> int:
         default=True,
     )
     parser.add_argument("--face-target-lock-min-iou", type=float, default=0.15)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel processes for --pairs-dir (1=serial). Try 32-48 on many-core hosts.",
+    )
+    parser.add_argument(
+        "--ort-intra-threads",
+        type=int,
+        default=1,
+        help="ORT intra_op_num_threads per worker (keep 1 when --workers>1)",
+    )
     args = parser.parse_args()
 
     mode_count = sum(
@@ -631,13 +852,26 @@ def main() -> int:
     if preview_dir and preview_max == 0:
         preview_max = 10**9
 
-    import onnxruntime as ort
+    workers = max(1, int(args.workers))
+    ort_intra = max(1, int(args.ort_intra_threads))
+    if workers > 1 and not args.pairs_dir:
+        print("[calib] WARN: --workers>1 only applies to --pairs-dir; using serial", flush=True)
+        workers = 1
 
-    ref_sess = ort.InferenceSession(ref_onnx, providers=["CPUExecutionProvider"])
+    _limit_cpu_threads(1)
+    ref_sess = None
+    need_ref_sess = args.random_only or bool(args.wav and args.mp4) or (
+        bool(args.pairs_dir) and workers <= 1
+    )
+    if need_ref_sess:
+        ref_sess = _create_ref_session(ref_onnx, intra_threads=ort_intra)
+
     print(
         f"[calib] shapes mixture=[1,{audio_len}] ref_feat=[1,{ref_ch},{ref_frames}] "
         f"image_size={vcfg.image_size} video={'mediapipe_lip' if vcfg.use_mediapipe_lip else 'fullframe'}"
     )
+    if args.pairs_dir:
+        print(f"[calib] workers={workers} ort_intra_threads={ort_intra}")
     if preview_dir:
         print(f"[calib] preview-dir={preview_dir} preview-max={preview_max}")
 
@@ -654,7 +888,7 @@ def main() -> int:
         n_written, lines = build_from_pairs_dir(
             pairs_dir,
             args.pairs_prefix,
-            ref_sess,
+            ref_onnx,
             out_dir,
             max_samples,
             audio_len,
@@ -663,6 +897,9 @@ def main() -> int:
             args.audio_sr,
             preview_dir=preview_dir,
             preview_max=preview_max,
+            workers=workers,
+            ort_intra_threads=ort_intra,
+            ref_sess=ref_sess,
         )
         if n_written <= 0:
             print("ERROR: no calibration samples from pairs-dir", file=sys.stderr)
@@ -687,6 +924,8 @@ def main() -> int:
             preview_budget=preview_max,
         )
 
+    if not args.pairs_dir:
+        lines = _sort_dataset_lines(lines)
     dataset_txt = os.path.join(out_dir, "dataset.txt")
     with open(dataset_txt, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + ("\n" if lines else ""))
