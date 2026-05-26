@@ -15,13 +15,39 @@ class ScaledSinuEmbedding(nn.Module):
         self.scale = nn.Parameter(torch.ones(1,))
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("pinned_emb", torch.zeros(0), persistent=False)
+        self._pinned_len = 0
 
-    def forward(self, x):
-        n, device = x.shape[1], x.device
+    def _build_emb(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         t = torch.arange(n, device=device).type_as(self.inv_freq)
         sinu = torch.mul(t.unsqueeze(-1), self.inv_freq.unsqueeze(0))
         emb = torch.cat((sinu.sin(), sinu.cos()), dim=-1)
         return emb * self.scale
+
+    def pin_length(self, n: int) -> None:
+        """Precompute [1, n, dim] table for fixed-length RKNN/ONNX export (no arange+Mul)."""
+        n = int(n)
+        emb = self._build_emb(n, self.inv_freq.device, self.inv_freq.dtype)
+        self.register_buffer("pinned_emb", emb.unsqueeze(0), persistent=False)
+        self._pinned_len = n
+
+    def clear_pin(self) -> None:
+        self.register_buffer("pinned_emb", torch.zeros(0), persistent=False)
+        self._pinned_len = 0
+
+    def forward(self, x):
+        n = int(x.shape[1])
+        if self._pinned_len > 0:
+            if n != self._pinned_len:
+                raise RuntimeError(
+                    f"ScaledSinuEmbedding pinned for n={self._pinned_len}, got x.shape[1]={n}"
+                )
+            out = self.pinned_emb.to(device=x.device, dtype=x.dtype)
+            if out.shape[0] != x.shape[0]:
+                out = out.expand(x.shape[0], -1, -1)
+            return out
+        device = x.device
+        return self._build_emb(n, device, x.dtype)
 
 
 class Linear(torch.nn.Module):

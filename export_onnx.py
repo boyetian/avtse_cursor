@@ -105,6 +105,24 @@ def _pin_decoder_ola_for_export(model, t_audio: int, kernel_size: int = 16) -> N
     print(f"[export] decoder OLA pinned T_frames={t_enc} (audio_len={t_audio})")
 
 
+def _prepare_sep_for_rknn_export(model, t_audio: int, kernel_size: int = 16) -> None:
+    """Pin fixed encoder-frame count and positional table for RKNN-friendly sep ONNX."""
+    inner = getattr(model, "model", None)
+    if inner is None:
+        return
+    sep = getattr(inner, "sep_network", None)
+    if sep is None or not hasattr(sep, "separator"):
+        return
+    from models.av_mossformer2_tse.av_mossformer2 import encoder_frame_count
+
+    t_enc = encoder_frame_count(int(t_audio), int(kernel_size))
+    sep.separator.fixed_encoder_frames = t_enc
+    masknet = sep.separator.masknet
+    if getattr(masknet, "use_global_pos_enc", False) and hasattr(masknet, "pos_enc"):
+        masknet.pos_enc.pin_length(t_enc)
+    print(f"[export] RKNN sep pinned T_enc={t_enc} fixed_encoder_frames + ScaledSinu (audio_len={t_audio})")
+
+
 def _use_decoder_ola_conv_for_export(model) -> None:
     """RKNN sep export: ConvTranspose OLA instead of scatter_add (ScatterElements)."""
     inner = getattr(model, "model", None)
@@ -192,6 +210,7 @@ def export_sep_rknn_onnx(
     if inner is None or not hasattr(inner, "sep_network"):
         raise RuntimeError("model.model.sep_network not found")
     if use_ola_conv:
+        _prepare_sep_for_rknn_export(model, t_audio)
         _use_decoder_ola_conv_for_export(model)
         print("[export] decoder OLA: ConvTranspose (RKNN experimental, may differ from training scatter)")
     else:
