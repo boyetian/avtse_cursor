@@ -118,10 +118,7 @@ def _use_decoder_ola_conv_for_export(model) -> None:
     if sep is None or not hasattr(sep, "decoder"):
         return
     sep.decoder.clear_fixed_ola_frames()
-    L = sep.decoder.L
-    with torch.no_grad():
-        sep.decoder.ola_conv.weight.copy_(torch.eye(L, dtype=torch.float32).view(L, 1, L))
-    print("[export] decoder OLA: ConvTranspose (RKNN sep, no ScatterElements)")
+    print("[export] decoder OLA: ConvTranspose path (RKNN sep, no ScatterElements)")
 
 
 def _prepare_rknn_scalar_safe(model, t_audio: int, kernel_size: int = 16) -> None:
