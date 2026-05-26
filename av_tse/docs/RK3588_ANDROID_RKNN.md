@@ -142,20 +142,6 @@ cd cpp/av_tse/scripts
 
 转换前会检查 `/proc/meminfo` 可用内存（默认 ≥36GiB，可用 `--min_avail_gb` 调整）。
 
-**拆分部署（推荐）**：`ref_encoder` 走 ORT，`separator` 走 RKNN。先导出再转换：
-
-```bash
-# 仓库根目录
-python export_onnx.py --export_rknn_split \
-  --infer_chunk_ms 500 --context_ms 100 --audio_sr 16000 --ref_sr 30
-
-python convert_av_mossformer_rknn.py \
-  --model checkpoints/AV_Mossformer/av_mossformer_sep_rknn.onnx \
-  --infer_chunk_ms 500 --audio_len 9600 --ref_frames 18 --dtype fp
-```
-
-若转换日志出现 `REGTASK: The bit width of field value exceeds the limit`（多为定长图中 `ScaledSinuEmbedding` 的 broadcast `Mul` 被展平超过 8191），请使用**含 `pin_length` 的当前 `export_onnx.py` 重新导出** `av_mossformer_sep_rknn.onnx` 后再转 RKNN。可用 `python scripts/diagnose_sep_onnx_rknn.py checkpoints/AV_Mossformer/av_mossformer_sep_rknn.onnx` 检查是否仍有大尺寸 `Mul`。`Unknown op target: 0` 在 `rknn building done` 时通常可忽略。
-
 ### 3.1 转换后验证
 
 1. PC 上 `rknn.init_runtime(target='rk3588')` 仿真（若 toolkit 支持）。

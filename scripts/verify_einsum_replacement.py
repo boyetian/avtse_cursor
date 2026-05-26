@@ -171,21 +171,6 @@ def test_scaled_sinu() -> None:
     _assert_close(got, ref, "ScaledSinuEmbedding")
 
 
-def test_scaled_sinu_pin_length() -> None:
-    torch.manual_seed(31)
-    dim = 16
-    n = 1199
-    m = ScaledSinuEmbedding(dim)
-    x = torch.randn(1, n, dim)
-    ref = m(x)
-    m.pin_length(n)
-    got = m(x)
-    _assert_close(got, ref, "ScaledSinuEmbedding pin_length")
-    m.clear_pin()
-    got2 = m(x)
-    _assert_close(got2, ref, "ScaledSinuEmbedding after clear_pin")
-
-
 def test_shift_left_one() -> None:
     torch.manual_seed(10)
     x = torch.randn(2, 11, 8)
@@ -272,8 +257,6 @@ def main() -> int:
     print("[ok] cal_attention causal=False")
     test_scaled_sinu()
     print("[ok] ScaledSinuEmbedding")
-    test_scaled_sinu_pin_length()
-    print("[ok] ScaledSinuEmbedding pin_length")
     test_shift_left_one()
     print("[ok] shift_left_one (replaces F.pad 1,-1)")
     test_rotary_embedding()
