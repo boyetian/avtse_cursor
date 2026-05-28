@@ -118,7 +118,7 @@ class Gated_FSMN_Block_Dilated(nn.Module):
         )
         self.norm1 = CLayerNorm(inner_channels)
         self.gated_fsmn = Gated_FSMN_dilated(
-            inner_channels, inner_channels, lorder=20, hidden_size=inner_channels, causal=causal
+            inner_channels, inner_channels, lorder=16, hidden_size=inner_channels, causal=causal
         )
         self.norm2 = CLayerNorm(inner_channels)
         self.conv2 = nn.Conv1d(inner_channels, dim, kernel_size=1)
@@ -150,7 +150,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self,
         *,
         dim,
-        group_size=64,
+        group_size=90,
         query_key_dim=128,
         expansion_factor=1.0,
         causal=False,
@@ -269,7 +269,7 @@ class FLASHTransformer_DualA_FSMN(nn.Module):
         *,
         dim,
         depth,
-        group_size=64,
+        group_size=90,
         query_key_dim=128,
         expansion_factor=4.0,
         causal=False,

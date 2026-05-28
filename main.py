@@ -187,7 +187,7 @@ def main():
     parser.add_argument(
         "--save_face_overlay_video_dir",
         type=str,
-        default="./测试结果_视频",
+        default="./测试结果_视频/人脸框",
         help="若指定目录，则保存原分辨率叠加框 mp4（绿=目标，黄=干扰），{id}_face_overlay.mp4；测 RTF 建议关闭",
     )
     parser.add_argument(
@@ -198,13 +198,13 @@ def main():
     parser.add_argument(
         "--overlay_write_stride",
         type=int,
-        default=5,
+        default=15,
         help="overlay 每 N 帧写 1 帧（2=减半编码量，降低 RTF 影响）",
     )
     parser.add_argument(
         "--overlay_scale",
         type=float,
-        default=0.5,
+        default=0.1,
         help="overlay 输出缩放，如 0.5=半分辨率，降低编码耗时",
     )
     parser.add_argument(
@@ -245,7 +245,7 @@ def main():
     parser.add_argument(
         "--face_target_policy",
         choices=["largest", "center", "center_largest", "center_largest_lock"],
-        default="center_largest",
+        default="center_largest_lock",
         help="多人脸时选目标: largest/center/center_largest; center_largest_lock=居中初选后锁定",
     )
     parser.add_argument(
@@ -314,8 +314,8 @@ def main():
     else:
         streamer = StreamInferenceSDK(**sdk_kwargs)
 
-    out_wav = "./测试结果/stream_sdk_main.wav"
-
+    out_wav = "./测试结果"
+    # out_wav = "./测试结果"
     # 2a)和2b) 二选一，推荐2a)，2b) 仅供兜底使用
 
     '''
@@ -350,9 +350,13 @@ def main():
     '''
     audio_dir = "./测试用例/音频"
     video_dir = "./测试用例/视频"
-    out_dir = os.path.dirname(out_wav)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    # audio_dir = "./测试用例/测试用例/audio_wav"
+    # video_dir = "./测试用例/测试用例/video"
+    # audio_dir = "./测试用例/测试用例/audio_wav/141.wav"
+    # video_dir = "./测试用例/测试用例/video/141.mp4"
+
+    out_dir = out_wav
+    os.makedirs(out_dir, exist_ok=True)
 
     if os.path.isdir(audio_dir):
         audio_files = sorted([f for f in os.listdir(audio_dir) if f.endswith(".wav")])

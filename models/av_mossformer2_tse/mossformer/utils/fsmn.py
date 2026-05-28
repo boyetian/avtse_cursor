@@ -33,7 +33,7 @@ class UniDeepFsmn(nn.Module):
 
 
 class DilatedDenseNet(nn.Module):
-    def __init__(self, depth=4, lorder=20, in_channels=64, causal: bool = False):
+    def __init__(self, depth=4, lorder=16, in_channels=64, causal: bool = False):
         super(DilatedDenseNet, self).__init__()
         self.depth = depth
         self.in_channels = in_channels

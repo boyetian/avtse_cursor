@@ -173,12 +173,6 @@ async def record_from_scp(chunk_begin, chunk_size):
     if args.audio_in.endswith(".scp"):
         f_scp = open(args.audio_in)
         wavs = f_scp.readlines()
-    elif os.path.isdir(args.audio_in):
-        # 文件夹模式：遍历所有 .wav 文件，格式与 scp 一致 (name path)
-        wav_dir = args.audio_in
-        wav_files = sorted([f for f in os.listdir(wav_dir) if f.lower().endswith(".wav")])
-        wavs = [f"{os.path.splitext(f)[0]} {os.path.join(wav_dir, f)}" for f in wav_files]
-        print(f"[文件夹模式] 找到 {len(wavs)} 个 .wav 文件")
     else:
         wavs = [args.audio_in]
 
@@ -211,8 +205,8 @@ async def record_from_scp(chunk_begin, chunk_size):
         wavs = wavs[chunk_begin:chunk_begin + chunk_size]
     for wav in wavs:
         wav_splits = wav.strip().split()
-
-        wav_name = wav_splits[0] if len(wav_splits) > 1 else os.path.splitext(os.path.basename(wav_splits[0]))[0]
+ 
+        wav_name = wav_splits[0] if len(wav_splits) > 1 else "demo"
         wav_path = wav_splits[1] if len(wav_splits) > 1 else wav_splits[0]
         if not len(wav_path.strip())>0:
            continue
@@ -271,12 +265,10 @@ async def record_from_scp(chunk_begin, chunk_size):
             
             await asyncio.sleep(sleep_duration)
     
-        await asyncio.sleep(3)
-        try:
-            await asyncio.wait_for(websocket.close(), timeout=5)
-        except asyncio.TimeoutError:
-            pass
-
+        if offline_msg_done:
+            await asyncio.sleep(3)
+            await websocket.close()
+            
         
           
 async def message(id):
@@ -284,16 +276,19 @@ async def message(id):
     text_print = ""
     text_print_2pass_online = ""
     text_print_2pass_offline = ""
+    # if args.output_dir is not None:
+    #     ibest_writer = open(os.path.join(args.output_dir, "text.{}".format(id)), "a", encoding="utf-8")
+    # else:
+    #     ibest_writer = None
     time_stamp_print = ""
     try:
         while True:
-
+        
             meg = await websocket.recv()
             meg = json.loads(meg)
-
-            is_final = meg.get('is_final', False)
-            print("is_final", is_final)
-            if is_final:
+            
+            print("is_final", meg['is_final'])
+            if meg['is_final']: 
                 print(meg)
                 websocket.recv_final_time = time.time()
 
@@ -304,77 +299,65 @@ async def message(id):
                 else:
                     print("注意：未记录到 audio_end_time，无法计算尾字延迟")
             websocket.last_word_time = time.time()
-
+            
             wav_name = meg.get("wav_name", "demo")
-            text = meg.get("text", "")
+            text = meg["text"]
+            if args.output_dir is not None:
+                ibest_writer = open(os.path.join(args.output_dir, "{}.asr.txt".format(wav_name)), "a", encoding="utf-8")
+            else:
+                ibest_writer = None
 
-            offline_msg_done = is_final
+            offline_msg_done = meg.get("is_final", False)
             timestamp=""
             if "timestamp" in meg:
                 timestamp = meg["timestamp"]
                 time_stamp_print += timestamp+"\n"
 
-            # 文本累积（仅用于有 mode 的消息的显示）
-            if 'mode' in meg:
-                if meg["mode"] == "online":
-                    text_print += "{}".format(text)
-                    text_print = text_print[-args.words_max_print:]
-                    # clear_console()
-                    print("\rpid" + str(id) + ": " + text_print)
-
-                    if offline_msg_done:
-                        print(time_stamp_print)
-                elif meg["mode"] == "offline":
-                    if timestamp !="":
-                        text_print += "{} timestamp: {}".format(text, timestamp)
-                    else:
-                        text_print += "{}".format(text)
-
-                    print("\rpid" + str(id) + ": " + wav_name + ": " + text_print)
-                    print(time_stamp_print)
-                else:
-                    if meg["mode"] == "2pass-online":
-                        text_print_2pass_online += "{}".format(text)
-                        text_print = text_print_2pass_offline + text_print_2pass_online
-                    else:   # 2pass-offline
-                        text_print_2pass_online = ""
-                        text_print = text_print_2pass_offline + "{}".format(text)
-                        text_print_2pass_offline += "{}".format(text)
-                    text_print = text_print[-args.words_max_print:]
-
-                    clear_console()
-                    print("\rpid" + str(id) + ": " + text_print)
-
-            # 只在收到最终结果时写入文件，用累积的完整文本
-            if is_final and args.output_dir is not None:
-                write_text = text_print_2pass_offline if args.mode == "2pass" else text_print
-                ibest_writer = open(os.path.join(args.output_dir, "{}.txt".format(wav_name)), "w", encoding="utf-8")
+            if ibest_writer is not None:
                 if timestamp !="":
-                    text_write_line = "{}\t{}\n".format(write_text, timestamp)
+                    text_write_line = "{}\t{}\t{}\n".format(wav_name, text, timestamp)
                 else:
-                    text_write_line = "{}\n".format(write_text)
+                    text_write_line = "{}\t{}\n".format(wav_name, text)
                 ibest_writer.write(text_write_line)
-                ibest_writer.close()
 
-            if is_final:
+            if 'mode' not in meg:
+                continue
+            if meg["mode"] == "online":
+                text_print += "{}".format(text)
+                text_print = text_print[-args.words_max_print:]
+                # clear_console()
+                print("\rpid" + str(id) + ": " + text_print)
+                
+                if offline_msg_done:
+                    print(time_stamp_print)
+            elif meg["mode"] == "offline":
+                if timestamp !="":
+                    text_print += "{} timestamp: {}".format(text, timestamp)
+                else:
+                    text_print += "{}".format(text)
+
+                print("\rpid" + str(id) + ": " + wav_name + ": " + text_print)
+                print(time_stamp_print)
+            else:
+                if meg["mode"] == "2pass-online":
+                    text_print_2pass_online += "{}".format(text)
+                    text_print = text_print_2pass_offline + text_print_2pass_online
+                else:   # 2pass-offline
+                    text_print_2pass_online = ""
+                    text_print = text_print_2pass_offline + "{}".format(text)
+                    text_print_2pass_offline += "{}".format(text)
+                text_print = text_print[-args.words_max_print:]
+                
+                clear_console()
+                print("\rpid" + str(id) + ": " + text_print)
+                
+            if meg["is_final"]:
                 break
 
     except Exception as e:
-            from websockets.exceptions import ConnectionClosedOK
-            if isinstance(e, ConnectionClosedOK):
-                print("Connection closed normally.")
-            else:
-                print("Exception:", e)
-                # 将错误写入日志文件，方便排查子进程中的异常
-                if args.output_dir is not None:
-                    try:
-                        import traceback
-                        with open(os.path.join(args.output_dir, "error.log"), "a", encoding="utf-8") as f:
-                            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Exception in message({id}): {e}\n")
-                            f.write(traceback.format_exc())
-                            f.write("\n")
-                    except:
-                        pass
+            print("Exception:", e)
+            #traceback.print_exc()
+            #await websocket.close()
  
 
 
@@ -397,31 +380,21 @@ async def ws_client(id, chunk_begin, chunk_size):
         uri = "ws://{}:{}".format(args.host, args.port)
         ssl_context = None
     print("connect to", uri)
-    async with websockets.connect(uri, subprotocols=["binary"], ping_interval=None, close_timeout=5, ssl=ssl_context) as websocket:
+    async with websockets.connect(uri, subprotocols=["binary"], ping_interval=None, ssl=ssl_context) as websocket:
         if args.audio_in is not None:
             task = asyncio.create_task(record_from_scp(i, 1))
         else:
             task = asyncio.create_task(record_microphone())
         task3 = asyncio.create_task(message(str(id)+"_"+str(i))) 
         await asyncio.gather(task, task3)
+  exit(0)
     
 
 def one_thread(id, chunk_begin, chunk_size):
     asyncio.get_event_loop().run_until_complete(ws_client(id, chunk_begin, chunk_size))
+    asyncio.get_event_loop().run_forever()
 
 if __name__ == '__main__':
-    # 规范化路径
-    if args.audio_in is not None:
-        args.audio_in = os.path.abspath(args.audio_in)
-
-    # 文件夹模式默认输出目录
-    if args.audio_in is not None and os.path.isdir(args.audio_in) and args.output_dir is None:
-        args.output_dir = os.path.abspath("测试结果/测试用例asr")
-
-    # 确保输出目录存在
-    if args.output_dir is not None and not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir, exist_ok=True)
-
     # for microphone
     if args.audio_in is None:
         p = Process(target=one_thread, args=(0, 0, 0))
@@ -433,11 +406,6 @@ if __name__ == '__main__':
         if args.audio_in.endswith(".scp"):
             f_scp = open(args.audio_in)
             wavs = f_scp.readlines()
-        elif os.path.isdir(args.audio_in):
-            # 文件夹模式：遍历所有 .wav 文件，格式与 scp 一致 (name path)
-            wav_dir = args.audio_in
-            wav_files = sorted([f for f in os.listdir(wav_dir) if f.lower().endswith(".wav")])
-            wavs = [f"{os.path.splitext(f)[0]} {os.path.join(wav_dir, f)}" for f in wav_files]
         else:
             wavs = [args.audio_in]
         for wav in wavs:

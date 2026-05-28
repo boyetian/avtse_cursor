@@ -1,11 +1,11 @@
-## Stable training preset for 24-head slim variant.
-## Keep architecture same as C_T2_24 but use more conservative optimization/eval.
+## Tiny debug: 1 train + 1 val + 1 test (see data/tiny_debug/mixture_1train_1val_1test.csv).
+## Single-GPU only (batch_size=1). Use scripts/train_tiny_debug.sh or eval_tiny_debug.sh.
 
 seed: 777
 use_cuda: 1
 
 speaker_no: 2
-mix_lst_path: ./data/3dSTA+LiAuto/mixture_all_2mix.csv
+mix_lst_path: ./data/tiny_debug/mixture_1train_1val_1test.csv
 mix_path_source: path_layout
 audio_direc: /data/megastore/Projects/tianxiaowen/dataset/v2_extracted_wav_aligned_p50_withoutBGM
 mixture_audio_direc: /data/megastore/Projects/tianxiaowen/dataset/v2_extracted_wav_aligned_p50_withoutBGM
@@ -13,125 +13,85 @@ reference_direc: /data/megastore/Datasets/FaceVideoData/opensource_dataset/DH-Fa
 audio_sr: 16000
 ref_sr: 30
 use_cached_visual: 1
-visual_cache_root: /data/megastore/Projects/tianxiaowen/dataset/v2_visual_cache_mediapipe
+visual_cache_root: /data/megastore/Projects/tianxiaowen/dataset/v2_visual_cache
 allow_cache_miss_fallback_mp4: 1
 
-num_workers: 6
-train_persistent_workers: 0
-pin_memory: 1
+num_workers: 0
+pin_memory: 0
 prefetch_factor: 2
-dataloader_timeout_s: 300
-val_num_workers: 0
-val_prefetch_factor: 2
-val_persistent_workers: 0
-val_dataloader_timeout_s: 600
-val_only_on_rank0: 1
-val_timeout_s: 1200
-batch_size: 16
+batch_size: 1
 accu_grad: 0
-effec_batch_size: 16
-max_length: 4
+effec_batch_size: 1
+max_length: 2
 load_interferer_visual: 0
 streaming_train: 1
 streaming_eval: 1
-# Optional: MediaPipe face/lip crop for training video (default full = legacy whole-frame resize).
-train_face_backend: mediapipe
-train_face_detector_model: /data/megastore/Projects/tianxiaowen/code/target_speaker_extraction_online/detector.tflite
-train_mediapipe_lip_crop: 1
-train_mediapipe_lip_crop_scale: 0.55
-train_mediapipe_detect_every_n: 5
-train_mediapipe_mouth_keypoint_indices: [3]
-visual_cache_variant: ''  # override auto subdir under visual_cache_root when using mediapipe caches
-# Train debug: under checkpoint_dir; batch_index=-1 = first eligible on rank0 worker0.
-# Also when use_cached_visual hits .npy. max_dumps=0 => unlimited (all rank0 minibatches, all workers).
-train_debug_visual_mp4: debug_train_vis
-train_debug_visual_under_checkpoint_dir: 1
-train_debug_visual_worker0_only: 0
-train_debug_visual_max_frames: 125
-train_debug_visual_batch_index: -1
-train_debug_visual_max_dumps: 100
 streaming_val_match_train: 1
-chunk_size_range: [3200, 8000]
-history_len_range: [0, 8000]
+chunk_size_range: [8000, 8000]
+history_len_range: [1600, 1600]
 future_len_range: [0, 0]
-
 streaming_multi_chunk: 1
 streaming_chunk_hop: 8000
-streaming_max_history: 8000
-
+streaming_max_history: 1600
 use_amp: 1
-eval_first_n: 1000
-eval_sample_random: 1
+eval_first_n: 1
+eval_sample_random: 0
 debug_cuda_launch_blocking: 0
 debug_batch_shapes: 0
 debug_sync_cuda: 0
 
-# IMPORTANT: only set to a checkpoint with the SAME architecture.
-# If no strict-match checkpoint exists, keep 'None' and train from scratch.
-init_from: './checkpoints/18_160_stream'
+# Load weights from another run (same architecture). 'None' = scratch.
+init_from: 'None'
 causal: 1
 path_layout: dh_flat
 
 network_reference:
   cue: lip
   backbone: resnet18
-  emb_size: 96
-  resnet_stage_channels: [48, 96, 192, 384]
+  emb_size: 64
+  resnet_stage_channels: [32, 64, 128, 256]
   conv3d_kernel: [3, 5, 5]
   use_adaptive_pool: 1
-  visual_conv_hidden: 192
-  resnet_out_channels: 384
-  visual_pw_groups: 2
+  visual_conv_hidden: 128
+  resnet_out_channels: 256
+  visual_pw_groups: 1
 
 network_audio:
   backbone: av_mossformer2_tse
   encoder_kernel_size: 16
   encoder_out_nchannels: 64
   encoder_in_nchannels: 1
-  masknet_inner_nchannels: 16      # 16 to 12
-
-  # Stream cache: train.py / solver.py keep this code path off (Separator only enables it
-  # when not self.training), so flipping these to 1 here only affects ingress streaming
-  # inference. With infer_mp4_ingress_stream.py --use_stream_cache=1 the script feeds the
-  # cumulative ring buffer; stream_cache makes per-hop separator/ref_encoder cost depend on
-  # block+overlap rather than full context.
+  masknet_inner_nchannels: 12
   stream_cache_enable: 0
   ref_stream_cache_enable: 0
-  # Audio-domain encoder frames (kernel=16 stride=8): hop=200ms*16k/8=400 frames -> block>=400.
-  # Overlap >= 1 FLASH group_size (256) so cumsum-based attention has warmup before the kept tail.
   stream_block_frames: 400
   stream_overlap_frames: 256
-  # Ref-domain (visual) frames at 30 fps: hop=200ms*30=6 frames; overlap covers conv3d+5xVisualConv1D RF.
   ref_stream_block_frames: 8
   ref_stream_overlap_frames: 32
-  # Per-hop gating: 1 = try cache every hop; refresh every N hops to bound drift.
-  # 0 = never force a full recompute (each refresh hop ~1.5x normal cost; total saving ~6%).
-  # If long-clip drift becomes audible, raise to 16/32 instead of going back to 8.
-  stream_cache_gate_every_hops: 0
+  stream_cache_gate_every_hops: 1
   stream_cache_refresh_every_hops: 0
   stream_cache_debug: 0
-
   masknet_numspks: 1
   masknet_chunksize: 250
   masknet_numlayers: 1
   masknet_norm: "ln"
   masknet_useextralinearlayer: False
   masknet_extraskipconnection: True
-  intra_numlayers: 18             # 20 to 18
-  fsmn_inner_channels: 160         # 256 to 160
+  intra_numlayers: 8
+  fsmn_inner_channels: 64
   intra_nhead: 8
   intra_dffn: 64
   intra_dropout: 0
   intra_use_positional: True
   intra_norm_before: True
-  image_size: 96
+  image_size: 64
   tcn_attractor: 0
 
 loss_type: sisdr
 init_learning_rate: 0.0001
 lr_warmup: 1
 lr_warmup_steps: 3000
-max_epoch: 150
+max_epoch: 1
 clip_grad_norm: 5
 stop_on_nan: 1
-save_every_n_train_samples: 50000
+save_every_n_train_samples: 0
