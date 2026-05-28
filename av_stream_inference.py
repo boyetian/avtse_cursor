@@ -151,6 +151,8 @@ class _SplitOnnxModelWrapper:
             f"[ONNX/split] ref_encoder + sep | fixed mixture [*, {self.fixed_t_audio}], "
             f"ref_feat [*, C, {self.fixed_t_ref}]"
         )
+        self.prof_ref_encoder_s = 0.0
+        self.prof_sep_s = 0.0
 
     @staticmethod
     def _rgb_to_gray_np(ref_bt_hwc: np.ndarray) -> np.ndarray:
@@ -201,8 +203,19 @@ class _SplitOnnxModelWrapper:
 
     def call_numpy(self, mixture_np, ref_np):
         gray = self._prepare_gray_ref(ref_np)
+        t0 = time.perf_counter()
         ref_feat = self.ref_sess.run(None, {"ref_gray": gray})[0]
-        return self._run_sep(mixture_np, ref_feat)
+        self.prof_ref_encoder_s += time.perf_counter() - t0
+        t0 = time.perf_counter()
+        out = self._run_sep(mixture_np, ref_feat)
+        self.prof_sep_s += time.perf_counter() - t0
+        return out
+
+    def get_and_reset_profiling(self):
+        ref_s, sep_s = self.prof_ref_encoder_s, self.prof_sep_s
+        self.prof_ref_encoder_s = 0.0
+        self.prof_sep_s = 0.0
+        return ref_s, sep_s
 
     def clear_stream_cache(self):
         pass
@@ -1077,6 +1090,9 @@ class AVStreamInference:
         self._rtf_prof_face_s = 0.0
         self._rtf_prof_model_s = 0.0
         self._rtf_prof_align_s = 0.0
+        self._rtf_prof_ref_encoder_s = 0.0
+        self._rtf_prof_sep_s = 0.0
+        self._rtf_prof_stream_inference_s = 0.0
         if int(cpu_threads) > 0:
             _apply_cpu_thread_limits(int(cpu_threads))
 
@@ -1397,21 +1413,32 @@ class AVStreamInference:
         self._overlay_worker = None
         self._overlay_video_frame_idx = 0
         self._overlay_dropped_frames = 0
-        self._rtf_prof_face_s = 0.0
-        self._rtf_prof_model_s = 0.0
-        self._rtf_prof_align_s = 0.0
 
-    def print_rtf_profile(self) -> None:
+    def print_rtf_profile(self, sum_sdk_s: float = 0.0, audio_dur_s: float = 0.0) -> None:
         total = self._rtf_prof_face_s + self._rtf_prof_model_s + self._rtf_prof_align_s
         if total <= 1e-9:
             print("[rtf profile] no samples recorded")
             return
-        print(
-            f"[rtf profile] face={self._rtf_prof_face_s:.3f}s ({100*self._rtf_prof_face_s/total:.1f}%) "
-            f"model={self._rtf_prof_model_s:.3f}s ({100*self._rtf_prof_model_s/total:.1f}%) "
-            f"align={self._rtf_prof_align_s:.3f}s ({100*self._rtf_prof_align_s/total:.1f}%) "
-            f"total={total:.3f}s"
-        )
+        sdk_overhead = sum_sdk_s - self._rtf_prof_stream_inference_s
+        si_other = self._rtf_prof_stream_inference_s - self._rtf_prof_face_s - self._rtf_prof_align_s - self._rtf_prof_model_s
+        if audio_dur_s > 1e-9:
+            rtf = sum_sdk_s / audio_dur_s
+            print(f"RTF(整体):       {rtf:.3f}  (sum_sdk={sum_sdk_s:.3f}s, audio_dur={audio_dur_s:.3f}s)")
+        print(f"  sumsdk(墙钟):   {sum_sdk_s:.3f} s")
+        print(f"  SDK(buffering): {sdk_overhead:.3f} s")
+        print(f"  face(MediaPipe): {self._rtf_prof_face_s:.3f} s")
+        print(f"  align:          {self._rtf_prof_align_s:.3f} s")
+        print(f"  model(总推理):   {self._rtf_prof_model_s:.3f} s")
+        if self._rtf_prof_ref_encoder_s > 1e-9 or self._rtf_prof_sep_s > 1e-9:
+            print(f"    ref_encoder(CPU ONNX): {self._rtf_prof_ref_encoder_s:.3f} s")
+            print(f"    sep_rknn(CPU ONNX):    {self._rtf_prof_sep_s:.3f} s")
+        print(f"  other(其他):    {si_other:.3f} s")
+        self._rtf_prof_face_s = 0.0
+        self._rtf_prof_model_s = 0.0
+        self._rtf_prof_align_s = 0.0
+        self._rtf_prof_ref_encoder_s = 0.0
+        self._rtf_prof_sep_s = 0.0
+        self._rtf_prof_stream_inference_s = 0.0
 
     def reset(self, reopen_face_video: bool = True):
         self._close_face_video_writer()
@@ -1524,6 +1551,7 @@ class AVStreamInference:
         sr_in = int(self.audio_sr if sampling_rate is None else sampling_rate)
         audio_in = self._normalize_audio_chunk(audio_chunk, sampling_rate=sr_in)
         video_in = self._normalize_video_chunk(video_chunk)
+        t_total0 = time.perf_counter()
 
         new_faces: List[np.ndarray] = []
         src_face_valid: List[bool] = []
@@ -1638,6 +1666,10 @@ class AVStreamInference:
                     vid_face_valid=fv_al,
                 )
                 self._rtf_prof_model_s += time.perf_counter() - t_model0
+                if hasattr(self.model, "get_and_reset_profiling"):
+                    ref_s, sep_s = self.model.get_and_reset_profiling()
+                    self._rtf_prof_ref_encoder_s += ref_s
+                    self._rtf_prof_sep_s += sep_s
                 if new_segs:
                     outputs.extend([seg.astype(np.float32, copy=False) for seg in new_segs])
 
@@ -1645,5 +1677,6 @@ class AVStreamInference:
             self._close_face_video_writer()
             self._close_overlay_video_writer()
             self.reset(reopen_face_video=False)
+        self._rtf_prof_stream_inference_s += time.perf_counter() - t_total0
         return outputs
 

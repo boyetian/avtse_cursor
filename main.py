@@ -118,7 +118,7 @@ def run_case_b_full_numpy(
         # RTF计算
 
         results.extend(outputs)
-        print(f"[Case B] 进度: {i + 1}/{total}，本次输出 {len(outputs)} 段")
+        # print(f"[Case B] 进度: {i + 1}/{total}，本次输出 {len(outputs)} 段")
         
     # RTF计算
     audio_dur_s = float(wav_arr.shape[1]) / float(max(1, int(sr)))
@@ -348,8 +348,8 @@ def main():
     '''
     2b) 文件读取兜底示例（可按需注释）：
     '''
-    audio_dir = "./测试用例/音频"
-    video_dir = "./测试用例/视频"
+    audio_dir = "./测试用例/音频/03.wav"
+    video_dir = "./测试用例/视频/fps24/03_24fps_1080_1080.mp4"
     # audio_dir = "./测试用例/测试用例/audio_wav"
     # video_dir = "./测试用例/测试用例/video"
     # audio_dir = "./测试用例/测试用例/audio_wav/141.wav"
@@ -418,6 +418,7 @@ def main():
         # RTF计算
         rtf = sum_sdk_s / audio_dur_s if audio_dur_s > 1e-9 else float("nan")
         print(f"RTF: {rtf:.3f}  (sum_sdk={sum_sdk_s:.3f}s, audio_dur={audio_dur_s:.3f}s)")
+        streamer._core.print_rtf_profile(sum_sdk_s, audio_dur_s)
         # RTF计算
 
         if outputs_all:

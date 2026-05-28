@@ -11,7 +11,7 @@ audio_direc: /data/megastore/Projects/tianxiaowen/dataset/v2_extracted_wav_align
 mixture_audio_direc: /data/megastore/Projects/tianxiaowen/dataset/v2_extracted_wav_aligned_p50_withoutBGM
 reference_direc: /data/megastore/Datasets/FaceVideoData/opensource_dataset/DH-FaceVid-1K
 audio_sr: 16000
-ref_sr: 30
+ref_sr: 24
 use_cached_visual: 1
 visual_cache_root: /data/megastore/Projects/tianxiaowen/dataset/v2_visual_cache
 allow_cache_miss_fallback_mp4: 1
