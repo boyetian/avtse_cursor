@@ -1,10 +1,11 @@
-"""8 通道 PCM -> 单通道 WAV（供 main.py 与命令行使用）。"""
+"""PCM -> WAV 转换（支持 8 通道混音与单通道直转）。"""
 from __future__ import annotations
 
 import argparse
 import os
 import sys
 
+import numpy as np
 import soundfile as sf
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,6 +15,17 @@ if _PREPARE_DIR not in sys.path:
 
 from prepare_chunk_input import mix_channels, read_8ch_pcm  # noqa: E402
 
+_DTYPE_MAP = {"int16": np.int16, "int32": np.int32, "float32": np.float32}
+
+
+def read_1ch_pcm(pcm_path: str, sr: int, dtype: str):
+    """读取单通道交错 PCM，返回 (mono, sr)。"""
+    np_dtype = _DTYPE_MAP[dtype]
+    raw = np.fromfile(pcm_path, dtype=np_dtype).astype(np.float32)
+    if np.issubdtype(np_dtype, np.integer):
+        raw /= np.iinfo(np_dtype).max
+    return np.squeeze(raw), int(sr)
+
 
 def convert_pcm_to_wav(
     pcm_path: str,
@@ -22,10 +34,17 @@ def convert_pcm_to_wav(
     sr: int = 16000,
     dtype: str = "int16",
     mode: str = "clean",
+    channels: int = 8,
 ) -> str:
-    """将 8ch 交错 PCM 混成单通道并写入 WAV，返回 out_path。"""
-    pcm_8ch, _ = read_8ch_pcm(pcm_path, int(sr), dtype)
-    mono = mix_channels(pcm_8ch, mode)
+    """将 PCM 混成单通道并写入 WAV，返回 out_path。
+
+    channels=8 时读取 8 通道 PCM 并混音；channels=1 时直接从单通道 PCM 写入。
+    """
+    if channels == 1:
+        mono, _ = read_1ch_pcm(pcm_path, int(sr), dtype)
+    else:
+        pcm_8ch, _ = read_8ch_pcm(pcm_path, int(sr), dtype)
+        mono = mix_channels(pcm_8ch, mode)
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -40,6 +59,7 @@ def convert_pcm_dir_to_wav_dir(
     sr: int = 16000,
     dtype: str = "int16",
     mode: str = "clean",
+    channels: int = 8,
 ) -> list[str]:
     """将文件夹下所有 PCM 混成单通道 WAV，返回已转换文件的路径列表。"""
     pcm_files = sorted([f for f in os.listdir(pcm_dir) if f.lower().endswith(".pcm")])
@@ -52,11 +72,11 @@ def convert_pcm_dir_to_wav_dir(
     for i, pcm_file in enumerate(pcm_files):
         pcm_path = os.path.join(pcm_dir, pcm_file)
         stem = os.path.splitext(pcm_file)[0]
-        out_path = os.path.join(out_dir, f"{stem}_{mode}.wav")
+        out_path = os.path.join(out_dir, f"{stem}.wav")
 
-        convert_pcm_to_wav(pcm_path, out_path, sr=sr, dtype=dtype, mode=mode)
+        convert_pcm_to_wav(pcm_path, out_path, sr=sr, dtype=dtype, mode=mode, channels=channels)
         converted.append(out_path)
-        print(f"[{i + 1}/{len(pcm_files)}] 已转换: {pcm_file} -> {stem}_{mode}.wav")
+        print(f"[{i + 1}/{len(pcm_files)}] 已转换: {pcm_file} -> {stem}.wav")
 
     return converted
 
@@ -70,13 +90,14 @@ def main() -> None:
     p.add_argument("--sr", type=int, default=16000)
     p.add_argument("--dtype", default="int16")
     p.add_argument("--mode", default="clean", choices=["clean", "noisy"])
+    p.add_argument("--channels", type=int, default=8, help="PCM 通道数 (1 或 8)")
     args = p.parse_args()
 
     # 批量模式
     if args.pcm_dir:
         out_dir = args.out_dir or args.pcm_dir
         converted = convert_pcm_dir_to_wav_dir(
-            args.pcm_dir, out_dir, sr=args.sr, dtype=args.dtype, mode=args.mode
+            args.pcm_dir, out_dir, sr=args.sr, dtype=args.dtype, mode=args.mode, channels=args.channels
         )
         print(f"\n[完成] 共转换 {len(converted)} 个文件 -> {out_dir}")
         return
@@ -87,8 +108,8 @@ def main() -> None:
     out = args.out
     if out is None:
         stem = os.path.splitext(os.path.basename(args.pcm))[0]
-        out = os.path.join(os.path.dirname(args.pcm) or ".", f"{stem}_{args.mode}.wav")
-    convert_pcm_to_wav(args.pcm, out, sr=args.sr, dtype=args.dtype, mode=args.mode)
+        out = os.path.join(os.path.dirname(args.pcm) or ".", f"{stem}.wav")
+    convert_pcm_to_wav(args.pcm, out, sr=args.sr, dtype=args.dtype, mode=args.mode, channels=args.channels)
     info = sf.info(out)
     print(f"out: {out}")
     print(f"sr={info.samplerate} Hz, duration={info.duration:.3f}s")

@@ -48,13 +48,13 @@ path_layout: dh_flat
 network_reference:
   cue: lip
   backbone: resnet18
-  emb_size: 64                        # 不变
-  resnet_stage_channels: [24, 48, 96, 192]  # 原 [32, 64, 128, 256]
-  conv3d_kernel: [3, 5, 5]            # 不变
-  use_adaptive_pool: 1                # 不变
-  visual_conv_hidden: 128             # 不变（改小效果很小）
-  resnet_out_channels: 192            # 原 256
-  visual_pw_groups: 1                 # 不变
+  emb_size: 64
+  resnet_stage_channels: [32, 64, 128, 256]
+  conv3d_kernel: [3, 5, 5]
+  use_adaptive_pool: 1
+  visual_conv_hidden: 128
+  resnet_out_channels: 256
+  visual_pw_groups: 1
 
 network_audio:
   backbone: av_mossformer2_tse

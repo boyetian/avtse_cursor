@@ -348,8 +348,10 @@ def main():
     '''
     2b) 文件读取兜底示例（可按需注释）：
     '''
-    audio_dir = "./测试用例/音频/03.wav"
-    video_dir = "./测试用例/视频/fps24/03_24fps_1080_1080.mp4"
+    audio_dir = "./测试用例/音频"
+    video_dir = "./测试用例/视频"
+    # audio_dir = "./测试用例/音频/03.wav"
+    # video_dir = "./测试用例/视频/fps24/03_24fps_1080_1080.mp4"
     # audio_dir = "./测试用例/测试用例/audio_wav"
     # video_dir = "./测试用例/测试用例/video"
     # audio_dir = "./测试用例/测试用例/audio_wav/141.wav"

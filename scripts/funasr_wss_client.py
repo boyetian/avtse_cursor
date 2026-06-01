@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.ERROR)
 parser = argparse.ArgumentParser()
 parser.add_argument("--host",
                     type=str,
-                    default="localhost",
+                    default="192.168.89.105",
                     required=False,
                     help="host ip, localhost, 0.0.0.0")
 parser.add_argument("--port",
@@ -97,7 +97,7 @@ parser.add_argument("--svs_lang",
 
 parser.add_argument("--mode",
                     type=str,
-                    default="2pass",
+                    default="offline",
                     help="offline, online, 2pass")
 
 args = parser.parse_args()
@@ -171,7 +171,7 @@ async def record_from_scp(chunk_begin, chunk_size):
     global voices, offline_msg_done
     is_finished = False
     if args.audio_in.endswith(".scp"):
-        f_scp = open(args.audio_in)
+        f_scp = open(args.audio_in, encoding='utf-8')
         wavs = f_scp.readlines()
     else:
         wavs = [args.audio_in]
@@ -205,8 +205,8 @@ async def record_from_scp(chunk_begin, chunk_size):
         wavs = wavs[chunk_begin:chunk_begin + chunk_size]
     for wav in wavs:
         wav_splits = wav.strip().split()
- 
-        wav_name = wav_splits[0] if len(wav_splits) > 1 else "demo"
+
+        wav_name = wav_splits[0] if len(wav_splits) > 1 else os.path.splitext(os.path.basename(wav_splits[0]))[0]
         wav_path = wav_splits[1] if len(wav_splits) > 1 else wav_splits[0]
         if not len(wav_path.strip())>0:
            continue
@@ -265,9 +265,11 @@ async def record_from_scp(chunk_begin, chunk_size):
             
             await asyncio.sleep(sleep_duration)
     
-        if offline_msg_done:
-            await asyncio.sleep(3)
-            await websocket.close()
+        await asyncio.sleep(3)
+        try:
+            await asyncio.wait_for(websocket.close(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
             
         
           
@@ -283,10 +285,10 @@ async def message(id):
     time_stamp_print = ""
     try:
         while True:
-        
+
             meg = await websocket.recv()
             meg = json.loads(meg)
-            
+
             print("is_final", meg['is_final'])
             if meg['is_final']: 
                 print(meg)
@@ -302,10 +304,6 @@ async def message(id):
             
             wav_name = meg.get("wav_name", "demo")
             text = meg["text"]
-            if args.output_dir is not None:
-                ibest_writer = open(os.path.join(args.output_dir, "{}.asr.txt".format(wav_name)), "a", encoding="utf-8")
-            else:
-                ibest_writer = None
 
             offline_msg_done = meg.get("is_final", False)
             timestamp=""
@@ -313,12 +311,10 @@ async def message(id):
                 timestamp = meg["timestamp"]
                 time_stamp_print += timestamp+"\n"
 
-            if ibest_writer is not None:
-                if timestamp !="":
-                    text_write_line = "{}\t{}\t{}\n".format(wav_name, text, timestamp)
-                else:
-                    text_write_line = "{}\t{}\n".format(wav_name, text)
-                ibest_writer.write(text_write_line)
+            if offline_msg_done:
+                # 2pass-offline: text_print_2pass_offline already accumulated full transcript.
+                # No need to save here — write at connection close.
+                pass
 
             if 'mode' not in meg:
                 continue
@@ -350,14 +346,26 @@ async def message(id):
                 
                 clear_console()
                 print("\rpid" + str(id) + ": " + text_print)
-                
-            if meg["is_final"]:
-                break
+
 
     except Exception as e:
-            print("Exception:", e)
-            #traceback.print_exc()
-            #await websocket.close()
+            from websockets.exceptions import ConnectionClosedOK
+            if isinstance(e, ConnectionClosedOK):
+                # Write full transcript accumulated during the session
+                if args.output_dir:
+                    output_dir = args.output_dir
+                else:
+                    output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.audio_in))), "audio_asr")
+                os.makedirs(output_dir, exist_ok=True)
+                wav_name = os.path.splitext(os.path.basename(args.audio_in))[0]
+                output_path = os.path.join(output_dir, f"{wav_name}.txt")
+                full_text = text_print_2pass_offline.strip() or text_print.strip()
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(full_text)
+                print(f"结果已保存至: {output_path}  ({len(full_text)}字)")
+                print("Connection closed normally.")
+            else:
+                print("Exception:", e)
  
 
 
@@ -380,19 +388,24 @@ async def ws_client(id, chunk_begin, chunk_size):
         uri = "ws://{}:{}".format(args.host, args.port)
         ssl_context = None
     print("connect to", uri)
-    async with websockets.connect(uri, subprotocols=["binary"], ping_interval=None, ssl=ssl_context) as websocket:
-        if args.audio_in is not None:
-            task = asyncio.create_task(record_from_scp(i, 1))
-        else:
-            task = asyncio.create_task(record_microphone())
-        task3 = asyncio.create_task(message(str(id)+"_"+str(i))) 
-        await asyncio.gather(task, task3)
-  exit(0)
-    
+    for retry in range(3):
+        try:
+            async with websockets.connect(uri, subprotocols=["binary"], ping_interval=None, close_timeout=5, open_timeout=10, ssl=ssl_context) as websocket:
+                if args.audio_in is not None:
+                    task = asyncio.create_task(record_from_scp(i, 1))
+                else:
+                    task = asyncio.create_task(record_microphone())
+                task3 = asyncio.create_task(message(str(id)+"_"+str(i)))
+                await asyncio.gather(task, task3)
+            break
+        except Exception as e:
+            print(f"连接失败 (重试 {retry+1}/3): {e}")
+            if retry == 2:
+                print(f"放弃处理: chunk {i}")
+
 
 def one_thread(id, chunk_begin, chunk_size):
-    asyncio.get_event_loop().run_until_complete(ws_client(id, chunk_begin, chunk_size))
-    asyncio.get_event_loop().run_forever()
+    asyncio.run(ws_client(id, chunk_begin, chunk_size))
 
 if __name__ == '__main__':
     # for microphone
@@ -404,7 +417,7 @@ if __name__ == '__main__':
     else:
         # calculate the number of wavs for each preocess
         if args.audio_in.endswith(".scp"):
-            f_scp = open(args.audio_in)
+            f_scp = open(args.audio_in, encoding='utf-8')
             wavs = f_scp.readlines()
         else:
             wavs = [args.audio_in]
