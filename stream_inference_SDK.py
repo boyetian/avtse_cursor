@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import List, Sequence, Optional, Tuple
+import time
+from typing import List, Optional
 
 import numpy as np
 
@@ -8,10 +9,10 @@ from av_stream_inference import AVStreamInference
 
 
 class StreamInferenceSDK:
-    """
-    SDK 封装（对业务侧暴露 numpy 输入接口）：
+    """SDK 封装：模型初始化 + 底层推理接口。
+
     - 音频：np.ndarray，形状 (T,) 或 (C,T)，默认按 axis=0 mean 混单通道
-    - 视频：frames 列表，List[np.ndarray(H,W,3)]，BGR/uint8
+    - 视频：pre-cropped frames，List[np.ndarray(H,W,3)]，float32 RGB
     """
 
     def __init__(
@@ -30,9 +31,6 @@ class StreamInferenceSDK:
         sep_onnx_path: Optional[str] = None,
         onnx_num_threads: int = 8,
         ts_path: Optional[str] = None,
-        save_face_video_path: Optional[str] = None,
-        overlay_write_stride: int = 1,
-        overlay_scale: float = 1.0,
         face_detector: str = "haar",
         face_detector_model_path: str = "detector.tflite",
         mediapipe_use_lip_center_crop: int = 0,
@@ -45,13 +43,12 @@ class StreamInferenceSDK:
     ):
         self.default_fps = float(default_fps)
         self._infer_chunk_ms = float(infer_chunk_ms)
-        resolved_use_stream_cache = int(use_stream_cache)
         self._core = AVStreamInference(
             config=config,
             checkpoint_dir=checkpoint_dir,
             use_cuda_override=int(use_cuda_override),
             cpu_threads=int(cpu_threads),
-            use_stream_cache=int(resolved_use_stream_cache),
+            use_stream_cache=int(use_stream_cache),
             context_ms=float(context_ms),
             infer_chunk_ms=float(infer_chunk_ms),
             max_history_ms=float(max_history_ms),
@@ -60,9 +57,6 @@ class StreamInferenceSDK:
             sep_onnx_path=sep_onnx_path,
             onnx_num_threads=int(onnx_num_threads),
             ts_path=ts_path,
-            save_face_video_path=save_face_video_path,
-            overlay_write_stride=int(overlay_write_stride),
-            overlay_scale=float(overlay_scale),
             face_detector=str(face_detector),
             face_detector_model_path=str(face_detector_model_path),
             mediapipe_use_lip_center_crop=int(mediapipe_use_lip_center_crop),
@@ -73,18 +67,9 @@ class StreamInferenceSDK:
             face_target_lock=int(face_target_lock),
             face_target_lock_min_iou=float(face_target_lock_min_iou),
         )
-        # FIFO 缓存：上游可能给 <200ms 或 >200ms 的对齐 chunk，这里统一缓存后按 200ms 切块推理
-        self._audio_buf = np.array([], dtype=np.float32)  # [T]
-        self._video_buf: List[np.ndarray] = []  # List[frame]
-        self._need_core_start = True  # 下一个实际推理块要带 is_start=True
-
-    @property
-    def audio_sr(self) -> int:
-        return int(self._core.audio_sr)
 
     @staticmethod
     def _audio_to_mono_numpy(wav: np.ndarray) -> np.ndarray:
-        """按 `wav.mean(dim=0).numpy()` 的意图：numpy 输入统一混单通道，输出 (T,) float32。"""
         arr = np.asarray(wav)
         if arr.ndim == 2:
             arr = arr.mean(axis=0, dtype=np.float32)
@@ -92,137 +77,187 @@ class StreamInferenceSDK:
             raise ValueError(f"wav must be 1D or 2D [C,T], got shape={arr.shape}")
         return arr.astype(np.float32, copy=False)
 
-    @staticmethod
-    def _validate_frames(frames: Sequence[np.ndarray]) -> List[np.ndarray]:
-        fs = list(frames)
-        if not fs:
-            raise ValueError("frames is empty")
-        out: List[np.ndarray] = []
-        for f in fs:
-            frm = np.asarray(f)
-            if frm.ndim != 3 or int(frm.shape[2]) != 3:
-                raise ValueError(f"frame must be [H,W,3], got shape={frm.shape}")
-            if frm.dtype != np.uint8:
-                frm = np.clip(frm, 0, 255).astype(np.uint8)
-            out.append(frm)
-        return out
-
-    def stream_inference(
+    def stream_inference_precropped(
         self,
         audio_chunk: np.ndarray,
-        video_chunk: List[np.ndarray],
+        precropped_video: List[np.ndarray],
+        face_valid: List[bool],
         is_start: bool = False,
         is_end: bool = False,
         sampling_rate: int = 16000,
         fps: float = 25.0,
     ) -> List[np.ndarray]:
         audio = self._audio_to_mono_numpy(audio_chunk)
-        video = self._validate_frames(video_chunk)
         fps_f = float(fps) if np.isfinite(float(fps)) and float(fps) > 1e-3 else float(self.default_fps)
-        return self._core.stream_inference(
+        return self._core.stream_inference_precropped(
             audio_chunk=audio,
-            video_chunk=video,
+            precropped_video=precropped_video,
+            face_valid=face_valid,
             is_start=bool(is_start),
             is_end=bool(is_end),
             sampling_rate=int(sampling_rate),
             video_fps=fps_f,
         )
 
-    def process_av_stream(
-        self,
-        audio_chunk: np.ndarray,
-        video_chunk: Sequence[np.ndarray],
-        is_start: bool = False,
-        is_end: bool = False,
-        sampling_rate: int = 16000,
-        fps: float = 25.0,
-    ) -> List[np.ndarray]:
-        """
-        单次喂入（上游已对齐的）音频/视频 chunk。
-
-        规则：
-        - 缓存用 FIFO 队列
-        - 固定 200ms 为一个推理块：16kHz -> 3200 samples；25fps -> 5 frames
-        - 输入 <200ms：先缓存，凑够 200ms 再推
-        - 输入 >200ms：缓存后自动切成多个 200ms 推理块
-        - is_end=True：如果还剩不足 200ms 的尾巴，允许尾巴推一次
-        """
-        sr = int(sampling_rate)
-        if sr <= 0:
-            raise ValueError(f"invalid sampling_rate={sampling_rate}")
-        fps_f = float(fps) if np.isfinite(float(fps)) and float(fps) > 1e-3 else float(self.default_fps)
-
-        if bool(is_start):
-            self._audio_buf = np.array([], dtype=np.float32)
-            self._video_buf = []
-            self._need_core_start = True
-
-        a_in = self._audio_to_mono_numpy(audio_chunk)
-        v_in = self._validate_frames(video_chunk)
-
-        # 入队（FIFO）
-        if a_in.size > 0:
-            self._audio_buf = (
-                np.concatenate([self._audio_buf, a_in.astype(np.float32, copy=False)])
-                if self._audio_buf.size
-                else a_in.astype(np.float32, copy=False)
-            )
-        if v_in:
-            self._video_buf.extend(v_in)
-
-        # 按 infer_chunk_ms 出包
-        need_audio = int(round(float(sr) * (self._infer_chunk_ms / 1000.0)))
-        need_video = int(round(float(fps_f) * (self._infer_chunk_ms / 1000.0)))
-        need_audio = max(1, need_audio)
-        need_video = max(1, need_video)
-
-        outputs_all: List[np.ndarray] = []
-
-        def _pop_one_block() -> Tuple[np.ndarray, List[np.ndarray]]:
-            a = self._audio_buf[:need_audio]
-            self._audio_buf = self._audio_buf[need_audio:]
-            v = self._video_buf[:need_video]
-            del self._video_buf[:need_video]
-            return a, v
-
-        while int(self._audio_buf.shape[0]) >= need_audio and len(self._video_buf) >= need_video:
-            a_blk, v_blk = _pop_one_block()
-            segs = self.stream_inference(
-                audio_chunk=a_blk,
-                video_chunk=v_blk,
-                is_start=bool(self._need_core_start),
-                is_end=False,
-                sampling_rate=sr,
-                fps=fps_f,
-            )
-            self._need_core_start = False
-            outputs_all.extend(segs)
-
-        # 尾包：允许不足 200ms 推一次（要求两路都有数据）
-        if bool(is_end):
-            if int(self._audio_buf.shape[0]) > 0 and len(self._video_buf) > 0:
-                a_tail = self._audio_buf
-                v_tail = self._video_buf
-                self._audio_buf = np.array([], dtype=np.float32)
-                self._video_buf = []
-                segs = self.stream_inference(
-                    audio_chunk=a_tail,
-                    video_chunk=v_tail,
-                    is_start=bool(self._need_core_start),
-                    is_end=True,
-                    sampling_rate=sr,
-                    fps=fps_f,
-                )
-                self._need_core_start = True
-                outputs_all.extend(segs)
-            else:
-                # 没有尾巴可推，仍然重置状态（保证下一路流干净）
-                self._audio_buf = np.array([], dtype=np.float32)
-                self._video_buf = []
-                self._need_core_start = True
-
-        return outputs_all
-
     def close(self) -> None:
         self._core.close()
 
+
+class StreamProcessor:
+    """累积音频/视频 chunk，达到 infer_chunk_ms 后做人脸 go/no-go 并推理。
+
+    不持有文件句柄，不关心数据来源。测试模式和流式模式共用。
+
+    用法：
+        streamer = StreamInferenceSDK(...)
+        preprocessor = VisualPreprocessor(...)
+        processor = StreamProcessor(streamer, preprocessor, sr=16000, fps=25.0, infer_chunk_ms=500)
+        while streaming:
+            segs = processor.feed_chunk(audio_chunk, video_frames)
+        segs = processor.flush()
+        streamer.close()
+    """
+
+    def __init__(
+        self,
+        streamer: StreamInferenceSDK,
+        preprocessor,       # VisualPreprocessor
+        sr: int,
+        fps: float,
+        infer_chunk_ms: float,
+        record_crops: bool = False,
+    ):
+        self._streamer = streamer
+        self._preprocessor = preprocessor
+        self._sr = int(sr)
+        self._fps = float(fps)
+        self._infer_chunk_ms = float(infer_chunk_ms)
+        self._record_crops = bool(record_crops)
+
+        self._infer_audio_samples = max(1, int(round(self._sr * self._infer_chunk_ms / 1000.0)))
+        self._infer_frames = max(1, int(round(self._fps * self._infer_chunk_ms / 1000.0)))
+
+        # Accumulators
+        self._acc_audio_buf: np.ndarray = np.array([], dtype=np.float32)
+        self._acc_crops: list = []
+        self._acc_fv: List[bool] = []
+        self._first_face_chunk = True
+
+        # Crop recording
+        self._recorded_crops: list = []  # list of (list of np.ndarray) per inference window
+
+        # Timing
+        self._total_infer_audio_samples = 0
+        self._sum_inference_s = 0.0
+
+    @property
+    def total_infer_audio_duration_s(self) -> float:
+        return self._total_infer_audio_samples / max(1, self._sr)
+
+    @property
+    def sum_inference_s(self) -> float:
+        return self._sum_inference_s
+
+    def reset(self) -> None:
+        self._acc_audio_buf = np.array([], dtype=np.float32)
+        self._acc_crops = []
+        self._acc_fv = []
+        self._first_face_chunk = True
+        self._recorded_crops = []
+        self._total_infer_audio_samples = 0
+        self._sum_inference_s = 0.0
+
+    def get_recorded_crops(self) -> list:
+        """返回每个推理窗口的 crops 列表。
+
+        Returns:
+            list of (list of np.ndarray): 每个元素是一个窗口的 crops，float32 RGB。"""
+        return self._recorded_crops
+
+    def feed_chunk(
+        self,
+        audio_chunk: np.ndarray,   # (C,T) 或 (T,), float32
+        video_frames: list,        # list of BGR uint8 (H,W,3)
+    ) -> list:
+        """喂入一个 chunk 的音频+视频帧，返回推理结果列表（可能为空）。
+
+        Returns:
+            List[np.ndarray]: 分离后的音频段，每个 (T,) float32。无人脸时返回 []。
+        """
+        wav = np.asarray(audio_chunk)
+        if wav.ndim == 1:
+            wav = wav[np.newaxis, :]
+        wav = wav.astype(np.float32, copy=False)
+
+        r = self._preprocessor.process_chunk(video_frames)
+
+        self._acc_audio_buf = (
+            np.concatenate([self._acc_audio_buf, wav], axis=1)
+            if self._acc_audio_buf.size
+            else wav.astype(np.float32, copy=False)
+        )
+        self._acc_crops.extend(r["crops"])
+        self._acc_fv.extend(r["face_valid"])
+
+        outputs_all: list = []
+
+        while self._acc_audio_buf.shape[1] >= self._infer_audio_samples and len(self._acc_crops) >= self._infer_frames:
+            a_seg = self._acc_audio_buf[:, :self._infer_audio_samples]
+            v_seg = self._acc_crops[:self._infer_frames]
+            fv_seg = self._acc_fv[:self._infer_frames]
+
+            self._acc_audio_buf = self._acc_audio_buf[:, self._infer_audio_samples:]
+            self._acc_crops = self._acc_crops[self._infer_frames:]
+            self._acc_fv = self._acc_fv[self._infer_frames:]
+
+            if any(fv_seg):
+                if self._record_crops:
+                    self._recorded_crops.append(v_seg)
+                t0 = time.perf_counter()
+                segs = self._streamer.stream_inference_precropped(
+                    audio_chunk=a_seg,
+                    precropped_video=v_seg,
+                    face_valid=fv_seg,
+                    is_start=self._first_face_chunk,
+                    is_end=False,
+                    sampling_rate=self._sr,
+                    fps=self._fps,
+                )
+                self._sum_inference_s += time.perf_counter() - t0
+                outputs_all.extend(segs)
+                self._first_face_chunk = False
+                self._total_infer_audio_samples += a_seg.shape[1]
+
+        return outputs_all
+
+    def flush(self) -> list:
+        """清空剩余 buffer，返回尾部推理结果（is_end=True）。
+
+        Returns:
+            List[np.ndarray]: 尾部音频段。无人脸时返回 []。
+        """
+        outputs_all: list = []
+
+        if self._acc_audio_buf.ndim >= 2 and self._acc_audio_buf.shape[1] > 0 and self._acc_crops:
+            if any(self._acc_fv):
+                if self._record_crops:
+                    self._recorded_crops.append(self._acc_crops)
+                t0 = time.perf_counter()
+                segs = self._streamer.stream_inference_precropped(
+                    audio_chunk=self._acc_audio_buf,
+                    precropped_video=self._acc_crops,
+                    face_valid=self._acc_fv,
+                    is_start=self._first_face_chunk,
+                    is_end=True,
+                    sampling_rate=self._sr,
+                    fps=self._fps,
+                )
+                self._sum_inference_s += time.perf_counter() - t0
+                outputs_all.extend(segs)
+                self._total_infer_audio_samples += self._acc_audio_buf.shape[1]
+
+        self._acc_audio_buf = np.array([], dtype=np.float32)
+        self._acc_crops = []
+        self._acc_fv = []
+        self._first_face_chunk = True
+        return outputs_all

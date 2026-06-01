@@ -1,12 +1,12 @@
 import os
 import time
-from typing import Optional
 
 import cv2
 import numpy as np
 import soundfile as sf
 
-from stream_inference_SDK import StreamInferenceSDK
+from stream_inference_SDK import StreamInferenceSDK, StreamProcessor
+from visual_preprocessor import VisualPreprocessor
 
 
 def _load_video_frames_bgr(mp4_path: str):
@@ -28,111 +28,11 @@ def _load_video_frames_bgr(mp4_path: str):
     return frames, fps
 
 
-def run_case_a_stream_chunks(streamer: StreamInferenceSDK, chunk_iter, sr: int = 16000, fps: float = 25.0):
-    """
-    情况A：上游实时给对齐好的 chunk（每次一包）。
-    chunk_iter 的元素为 (a_chunk, v_chunk)：
-      - a_chunk: np.ndarray, shape (C,T) 或 (T,)
-      - v_chunk: List[np.ndarray], 每帧 (H,W,3), BGR
-    """
-    results = []
-    chunks = list(chunk_iter)
-    total = len(chunks)
-    for i, (a_chunk, v_chunk) in enumerate(chunks):
-        outputs = streamer.process_av_stream(
-            audio_chunk=a_chunk,
-            video_chunk=v_chunk,
-            is_start=(i == 0),
-            is_end=(i == total - 1),
-            sampling_rate=int(sr),
-            fps=float(fps),
-        )
-        results.extend(outputs)
-        print(f"[Case A] 进度: {i + 1}/{total}，本次输出 {len(outputs)} 段")
-    return results
-
-
-def run_case_b_full_numpy(
-    streamer: StreamInferenceSDK,
-    wav_np: np.ndarray,
-    frames_np: list,
-    chunk_ms: float,
-    sr: int,
-    fps: float,
-    chunk_fps: Optional[float] = None,
-):
-    """
-    情况B：上游一次性给整段 numpy（wav + frames），先按任意 chunk_ms 切块再逐包喂入。
-
-    chunk_fps: 按音频块分配视频帧时使用的帧率；默认用模型 ref_sr，与推理对齐一致。
-    fps: 仍传给 process_av_stream（overlay 等）；未指定 chunk_fps 时兼作分块帧率。
-    """
-    if chunk_fps is None:
-        chunk_fps = float(getattr(streamer._core, "ref_sr", fps))
-    chunk_fps = float(chunk_fps)
-    audio_step = max(1, int(round(float(sr) * (float(chunk_ms) / 1000.0))))
-    wav_arr = np.asarray(wav_np)
-    if wav_arr.ndim == 1:
-        wav_arr = wav_arr[np.newaxis, :]
-
-    audio_chunk_list = [wav_arr[:, i : i + audio_step] for i in range(0, int(wav_arr.shape[1]), audio_step)]
-
-    video_chunk_list = []
-    v_pos = 0
-    last_frame = frames_np[-1]
-    for a_chunk in audio_chunk_list:
-        dur_s = float(a_chunk.shape[1]) / float(max(1, int(sr)))
-        n_frames = max(1, int(round(chunk_fps * dur_s)))
-        one = []
-        for _ in range(n_frames):
-            if v_pos < len(frames_np):
-                last_frame = frames_np[v_pos]
-                one.append(last_frame)
-                v_pos += 1
-            else:
-                one.append(last_frame)
-        video_chunk_list.append(one)
-
-    results = []
-    total = min(len(audio_chunk_list), len(video_chunk_list))
-    # RTF计算
-    sum_process_av_stream_s = 0.0
-    # RTF计算
-
-    for i, (a_chunk, v_chunk) in enumerate(zip(audio_chunk_list[:total], video_chunk_list[:total])):
-        # RTF计算
-        t0 = time.perf_counter()
-        # RTF计算
-
-        outputs = streamer.process_av_stream(
-            audio_chunk=a_chunk,
-            video_chunk=v_chunk,
-            is_start=(i == 0),
-            is_end=(i == total - 1),
-            sampling_rate=int(sr),
-            fps=float(fps),
-        )
-        
-        # RTF计算
-        sum_process_av_stream_s += time.perf_counter() - t0
-        # RTF计算
-
-        results.extend(outputs)
-        # print(f"[Case B] 进度: {i + 1}/{total}，本次输出 {len(outputs)} 段")
-        
-    # RTF计算
-    audio_dur_s = float(wav_arr.shape[1]) / float(max(1, int(sr)))
-    return results, sum_process_av_stream_s, audio_dur_s
-    # RTF计算
-
-    # return results
-
-
 def main():
     '''
     1) 初始化
     '''
-    import argparse 
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--type",
@@ -179,55 +79,38 @@ def main():
         help="使用 checkpoints/AV_Mossformer/torch_jit_fixed.zip（定长 trace，与 av_mossformer2_fixed.onnx 同形）",
     )
     parser.add_argument(
-        "--save_face_video_dir",
-        type=str,
-        default="",
-        help="若指定目录，则保存裁出人脸 mp4（{id}_face.mp4），空=关闭",
-    )
-    parser.add_argument(
-        "--save_face_overlay_video_dir",
-        type=str,
-        default="./测试结果_视频/人脸框",
-        help="若指定目录，则保存原分辨率叠加框 mp4（绿=目标，黄=干扰），{id}_face_overlay.mp4；测 RTF 建议关闭",
-    )
-    parser.add_argument(
-        "--bench_rtf",
-        action="store_true",
-        help="测 RTF：关闭 overlay/face 视频写出，避免编码计入 process_av_stream",
-    )
-    parser.add_argument(
-        "--overlay_write_stride",
-        type=int,
-        default=15,
-        help="overlay 每 N 帧写 1 帧（2=减半编码量，降低 RTF 影响）",
-    )
-    parser.add_argument(
-        "--overlay_scale",
+        "--chunk_ms",
         type=float,
-        default=0.1,
-        help="overlay 输出缩放，如 0.5=半分辨率，降低编码耗时",
+        default=100.0,
+        help="输入切片粒度(ms)，测试模式下按此粒度切分整段文件模拟流式",
     )
     parser.add_argument(
-        "--face_detector",
-        choices=["haar", "mediapipe"],
-        default="mediapipe",
-        help="人脸检测后端: haar(OpenCV) 或 mediapipe",
+        "--write_lip",
+        action="store_true",
+        help="输出裁剪后的嘴唇/人脸视频",
+    )
+    parser.add_argument(
+        "--write_lip_dir",
+        type=str,
+        default="./测试结果_嘴唇视频",
+        help="--write_lip 输出目录",
     )
     parser.add_argument(
         "--face_detector_model",
         type=str,
         default="detector.tflite",
-        help="MediaPipe 人脸模型路径（face_detector=mediapipe 时使用）",
+        help="MediaPipe 人脸检测模型路径",
     )
     parser.add_argument(
         "--mediapipe_lip_crop",
+        type=int,
         default=1,
-        help="face_detector=mediapipe 时以嘴部关键点为中心做参考裁剪（边长按人脸框比例缩放）",
+        help="以嘴部关键点为中心做参考裁剪（边长按人脸框比例缩放）",
     )
     parser.add_argument(
         "--mediapipe_lip_crop_scale",
         type=float,
-        default=0.8,
+        default=0.55,
         help="嘴裁正方形边长 = 该系数 × last_box 边长（图像空间），再缩放到 face_crop_size",
     )
     parser.add_argument(
@@ -262,17 +145,13 @@ def main():
         help="锁定模式下与上一目标框 IoU 低于此值则不切换目标(保持上一帧)",
     )
     args = parser.parse_args()
-    if args.bench_rtf:
-        args.save_face_overlay_video_dir = ""
-        args.save_face_video_dir = ""
-        print("[bench_rtf] 已关闭 overlay/face 视频写出，RTF 仅含推理+人脸跟踪")
 
     sdk_kwargs = dict(
         infer_chunk_ms=args.infer_chunk_ms,
         context_ms=args.context_ms,
         max_history_ms=args.max_history_ms,
         use_stream_cache=args.use_stream_cache,
-        face_detector=args.face_detector,
+        face_detector="none",
         face_detector_model_path=args.face_detector_model,
         mediapipe_use_lip_center_crop=1 if args.mediapipe_lip_crop else 0,
         mediapipe_lip_crop_scale=float(args.mediapipe_lip_crop_scale),
@@ -281,8 +160,6 @@ def main():
         face_target_policy=str(args.face_target_policy),
         face_target_lock=int(args.face_target_lock),
         face_target_lock_min_iou=float(args.face_target_lock_min_iou),
-        overlay_write_stride=max(1, int(args.overlay_write_stride)),
-        overlay_scale=float(args.overlay_scale),
     )
     if args.type in ("onnx", "onnx_quant_dynamic"):
         if args.ref_onnx_path and args.sep_onnx_path:
@@ -315,47 +192,8 @@ def main():
         streamer = StreamInferenceSDK(**sdk_kwargs)
 
     out_wav = "./测试结果"
-    # out_wav = "./测试结果"
-    # 2a)和2b) 二选一，推荐2a)，2b) 仅供兜底使用
-
-    '''
-    2a) 直接使用上游已准备好的整段 numpy 输入（推荐）
-    - audio_np: np.ndarray, shape=(C,T) 或 (T,), dtype=float32
-    - video_frames_np: list[np.ndarray], 每帧 shape=(H,W,3), dtype=uint8, BGR
-    - sr: 采样率（例如 16000）
-    - fps: 帧率（例如 25.0）
-    '''
-    # # 下面这 4 个变量请由业务侧在调用 main() 前准备好。
-    # audio_np = None
-    # video_frames_np = None
-    # sr = 16000
-    # fps = 25.0
-
-    # if audio_np is None or video_frames_np is None:
-    #     raise ValueError(
-    #         "请先提供整段 numpy 输入：audio_np 与 video_frames_np。"
-    #         "如果你仍想从文件读取，可参考注释中的兜底示例。"
-    #     )
-
-    # wav = np.asarray(audio_np)
-    # if wav.ndim == 1:
-    #     wav = wav[np.newaxis, :]  # 统一为 (C,T)
-    # wav = wav.astype(np.float32, copy=False)
-    # frames = list(video_frames_np)
-    # sr = int(sr)
-    # fps = float(fps)
-
-    '''
-    2b) 文件读取兜底示例（可按需注释）：
-    '''
     audio_dir = "./测试用例/音频"
     video_dir = "./测试用例/视频"
-    # audio_dir = "./测试用例/音频/03.wav"
-    # video_dir = "./测试用例/视频/fps24/03_24fps_1080_1080.mp4"
-    # audio_dir = "./测试用例/测试用例/audio_wav"
-    # video_dir = "./测试用例/测试用例/video"
-    # audio_dir = "./测试用例/测试用例/audio_wav/141.wav"
-    # video_dir = "./测试用例/测试用例/video/141.mp4"
 
     out_dir = out_wav
     os.makedirs(out_dir, exist_ok=True)
@@ -390,38 +228,80 @@ def main():
         frames, fps = _load_video_frames_bgr(video_path)
         sr = int(sr_file)
 
-        if args.save_face_video_dir:
-            face_dir = str(args.save_face_video_dir)
-            os.makedirs(face_dir, exist_ok=True)
-            streamer._core.save_face_video_path = os.path.join(face_dir, f"{base_name}_face.mp4")
-            streamer._core._face_video_fps = float(fps)
-        else:
-            streamer._core.save_face_video_path = None
+        # === Part 1: 输入层 — 按 chunk_ms 切分整段文件，模拟流式输入 ===
+        chunk_ms = float(args.chunk_ms)
+        audio_step = max(1, int(round(sr * chunk_ms / 1000.0)))
+        v_per_chunk = max(1, int(round(fps * chunk_ms / 1000.0)))
+        total_samples = wav.shape[1]
+        num_chunks = (total_samples + audio_step - 1) // audio_step
 
-        if args.save_face_overlay_video_dir:
-            overlay_dir = str(args.save_face_overlay_video_dir)
-            os.makedirs(overlay_dir, exist_ok=True)
-            streamer._core.save_face_overlay_video_path = os.path.join(
-                overlay_dir, f"{base_name}_face_overlay.mp4"
-            )
-            streamer._core._face_video_fps = float(fps)
-        else:
-            streamer._core.save_face_overlay_video_path = None
-
-        # 3b) 情况B：整段 numpy -> 任意 chunk_ms 切块 -> 逐包调用 process_av_stream
-        outputs_all, sum_sdk_s, audio_dur_s = run_case_b_full_numpy(
-            streamer=streamer,
-            wav_np=wav,
-            frames_np=frames,
-            chunk_ms=100.0,
-            sr=int(sr),
-            fps=float(fps),
+        # === Part 2: 视觉处理层 — MediaPipe 检测 ===
+        crop_size = int(streamer._core._tracker_args["crop_size"])
+        preprocessor = VisualPreprocessor(
+            crop_size=crop_size,
+            model_path=str(args.face_detector_model),
+            use_lip_center_crop=bool(int(args.mediapipe_lip_crop)),
+            lip_crop_scale=float(args.mediapipe_lip_crop_scale),
+            lip_crop_min_px=int(args.mediapipe_lip_crop_min_px),
+            lip_crop_max_px=int(args.mediapipe_lip_crop_max_px),
+            target_policy=str(args.face_target_policy),
+            target_lock=bool(int(args.face_target_lock)),
+            target_lock_min_iou=float(args.face_target_lock_min_iou),
         )
-        # RTF计算
-        rtf = sum_sdk_s / audio_dur_s if audio_dur_s > 1e-9 else float("nan")
-        print(f"RTF: {rtf:.3f}  (sum_sdk={sum_sdk_s:.3f}s, audio_dur={audio_dur_s:.3f}s)")
-        streamer._core.print_rtf_profile(sum_sdk_s, audio_dur_s)
-        # RTF计算
+
+        # === Part 2+3: StreamProcessor ===
+        processor = StreamProcessor(
+            streamer=streamer,
+            preprocessor=preprocessor,
+            sr=sr,
+            fps=fps,
+            infer_chunk_ms=float(args.infer_chunk_ms),
+            record_crops=bool(args.write_lip),
+        )
+
+        outputs_all: list = []
+
+        for ci in range(num_chunks):
+            a_start = ci * audio_step
+            a_end = min(a_start + audio_step, total_samples)
+            a_chunk = wav[:, a_start:a_end]
+
+            v_start = ci * v_per_chunk
+            v_frames = frames[v_start : v_start + v_per_chunk]
+            if not v_frames:
+                break
+
+            segs = processor.feed_chunk(a_chunk, v_frames)
+            outputs_all.extend(segs)
+
+        # Tail flush：残留数据（不足 infer_chunk_ms）
+        segs = processor.flush()
+        outputs_all.extend(segs)
+
+        # --- 写裁剪视频 ---
+        if args.write_lip:
+            recorded = processor.get_recorded_crops()
+            if recorded and recorded[0]:
+                lip_dir = str(args.write_lip_dir)
+                os.makedirs(lip_dir, exist_ok=True)
+                out_lip = os.path.join(lip_dir, f"{base_name}_lip.mp4")
+                h, w = recorded[0][0].shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(out_lip, fourcc, fps, (w, h))
+                for crops in recorded:
+                    for crop in crops:
+                        frame_bgr = np.clip(crop, 0, 255).astype(np.uint8)[:, :, ::-1]
+                        writer.write(frame_bgr)
+                writer.release()
+                print(f"已保存嘴唇视频: {out_lip}")
+            else:
+                print(f"{base_name}: 未检测到人脸，无嘴唇视频")
+
+        # RTF
+        audio_dur_s = processor.total_infer_audio_duration_s
+        sum_inference_s = processor.sum_inference_s
+        rtf = sum_inference_s / audio_dur_s if audio_dur_s > 1e-9 else float("nan")
+        print(f"RTF: {rtf:.3f}  (sum_infer={sum_inference_s:.3f}s, infer_audio_dur={audio_dur_s:.3f}s)")
 
         if outputs_all:
             out_audio = np.concatenate(outputs_all, axis=0).astype(np.float32, copy=False)
@@ -436,4 +316,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import queue
-import threading
 import time
 from types import SimpleNamespace
 from typing import Any, List, Optional, Sequence, Tuple
@@ -606,15 +604,6 @@ def _overlay_font_params(out_w: int, out_h: int) -> Tuple[float, int, int]:
     return float(font_scale), box_th, txt_th
 
 
-def _scale_overlay_box(box: List[float], sx: float, sy: float) -> List[float]:
-    return [
-        float(box[0]) * sx,
-        float(box[1]) * sy,
-        float(box[2]) * sx,
-        float(box[3]) * sy,
-    ]
-
-
 def _to_video_index(sample_idx: int, audio_sr: int, ref_sr: float) -> int:
     return int(np.floor(float(sample_idx) / float(audio_sr) * float(ref_sr)))
 
@@ -710,28 +699,6 @@ def _align_audio_video_list(audio: np.ndarray, video_list: List[np.ndarray], aud
     exact_audio = int(np.floor(float(keep_video) / float(video_fps) * float(audio_sr)))
     exact_audio = max(1, min(exact_audio, int(audio.shape[0])))
     audio = audio[:exact_audio]
-    return audio, video_list
-
-
-def _apply_av_offset(
-    audio: np.ndarray,
-    video_list: List[np.ndarray],
-    audio_sr: int,
-    video_fps: float,
-    av_offset_ms: float,
-):
-    if abs(float(av_offset_ms)) < 1e-9:
-        return audio, video_list
-    if audio.size == 0 or len(video_list) == 0:
-        return audio, video_list
-    if av_offset_ms > 0:
-        off_samples = int(round(float(av_offset_ms) * float(audio_sr) / 1000.0))
-        off_samples = max(0, min(off_samples, int(audio.shape[0])))
-        audio = audio[off_samples:]
-    else:
-        off_frames = int(round(abs(float(av_offset_ms)) * float(video_fps) / 1000.0))
-        off_frames = max(0, min(off_frames, len(video_list)))
-        video_list = video_list[off_frames:]
     return audio, video_list
 
 
@@ -1050,10 +1017,6 @@ class AVStreamInference:
         ingress_warmup: int = 1,
         use_stream_cache: int = 1,
         max_history_ms: float = 200.0,
-        save_face_video_path: Optional[str] = None,
-        save_face_overlay_video_path: Optional[str] = None,
-        overlay_write_stride: int = 1,
-        overlay_scale: float = 1.0,
         face_detector: str = "haar",
         face_detector_model_path: str = "detector.tflite",
         mediapipe_use_lip_center_crop: int = 0,
@@ -1075,24 +1038,6 @@ class AVStreamInference:
         self.mediapipe_lip_crop_min_px = int(mediapipe_lip_crop_min_px)
         self.mediapipe_lip_crop_max_px = int(mediapipe_lip_crop_max_px)
         self._warned_stream_cache_fallback = False
-        self.save_face_video_path = str(save_face_video_path) if save_face_video_path else None
-        self.save_face_overlay_video_path = (
-            str(save_face_overlay_video_path) if save_face_overlay_video_path else None
-        )
-        self._face_video_writer = None
-        self.overlay_write_stride = max(1, int(overlay_write_stride))
-        self.overlay_scale = float(np.clip(float(overlay_scale), 0.1, 1.0))
-        self._overlay_queue: Optional[queue.Queue] = None
-        self._overlay_worker: Optional[threading.Thread] = None
-        self._overlay_video_frame_idx = 0
-        self._overlay_dropped_frames = 0
-        self._face_video_fps: float = 30.0
-        self._rtf_prof_face_s = 0.0
-        self._rtf_prof_model_s = 0.0
-        self._rtf_prof_align_s = 0.0
-        self._rtf_prof_ref_encoder_s = 0.0
-        self._rtf_prof_sep_s = 0.0
-        self._rtf_prof_stream_inference_s = 0.0
         if int(cpu_threads) > 0:
             _apply_cpu_thread_limits(int(cpu_threads))
 
@@ -1261,189 +1206,12 @@ class AVStreamInference:
             target_lock_min_iou=self.face_target_lock_min_iou,
         )
         self._started = False
-        self._face_video_fps = float(self.ref_sr)
-        self.reset(reopen_face_video=False)
+        self.reset()
 
-    def _open_face_video_writer(self, path: str, fps: float) -> None:
-        self._close_face_video_writer()
-        out_path = str(path)
-        parent = os.path.dirname(out_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        size = int(self._tracker_args["crop_size"])
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, float(fps), (size, size))
-        if not writer.isOpened():
-            print(f"[WARN] cannot open face video writer: {out_path}")
-            return
-        self._face_video_writer = writer
-        print(f"[face video] {out_path} @ {float(fps):.2f} fps, {size}x{size}")
-
-    def _write_face_frame(self, face_rgb: np.ndarray) -> None:
-        if self._face_video_writer is None:
-            return
-        frm = np.clip(face_rgb, 0.0, 255.0).astype(np.uint8)
-        if frm.ndim == 2:
-            frm = cv2.cvtColor(frm, cv2.COLOR_GRAY2BGR)
-        else:
-            frm = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
-        self._face_video_writer.write(frm)
-
-    def _close_face_video_writer(self) -> None:
-        if self._face_video_writer is not None:
-            self._face_video_writer.release()
-            self._face_video_writer = None
-
-    def _overlay_worker_loop(self) -> None:
-        writer = None
-        out_path = str(self.save_face_overlay_video_path or "")
-        write_fps = float(self._face_video_fps) / float(self.overlay_write_stride)
-        scale = float(self.overlay_scale)
-        while True:
-            item = self._overlay_queue.get()
-            if item is None:
-                break
-            frame_bgr, interferer_boxes, interferer_scores, last_box, target_score = item
-            h, w = frame_bgr.shape[:2]
-            out_w, out_h = w, h
-            sx = sy = 1.0
-            if writer is None:
-                parent = os.path.dirname(out_path)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(out_path, fourcc, write_fps, (out_w, out_h))
-                if not writer.isOpened():
-                    print(f"[WARN] cannot open face overlay video writer: {out_path}")
-                    writer = None
-                    self._overlay_queue.task_done()
-                    continue
-                print(
-                    f"[face overlay] {out_path} @ {write_fps:.2f} fps, {out_w}x{out_h} "
-                    f"(stride={self.overlay_write_stride}, scale={scale:.2f})"
-                )
-            vis = frame_bgr
-            fs, box_t, txt_t = _overlay_font_params(out_w, out_h)
-            for box, sc in zip(interferer_boxes, interferer_scores):
-                sb = _scale_overlay_box(list(box), sx, sy)
-                _draw_overlay_box_with_label(
-                    vis, sb, (0, 255, 255), sc, fs, box_t, txt_t
-                )
-            if last_box is not None:
-                sb = _scale_overlay_box(list(last_box), sx, sy)
-                _draw_overlay_box_with_label(
-                    vis, sb, (0, 255, 0), target_score, fs, box_t, txt_t
-                )
-            if writer is not None:
-                writer.write(vis)
-            self._overlay_queue.task_done()
-        if writer is not None:
-            writer.release()
-
-    def _ensure_overlay_worker(self) -> None:
-        if not self.save_face_overlay_video_path:
-            return
-        if self._overlay_worker is not None and self._overlay_worker.is_alive():
-            return
-        self._overlay_queue = queue.Queue(maxsize=32)
-        self._overlay_worker = threading.Thread(
-            target=self._overlay_worker_loop, name="face_overlay_writer", daemon=True
-        )
-        self._overlay_worker.start()
-
-    def _write_overlay_frame(self, frame_bgr: np.ndarray) -> None:
-        if not self.save_face_overlay_video_path:
-            return
-        self._overlay_video_frame_idx += 1
-        if (self._overlay_video_frame_idx - 1) % self.overlay_write_stride != 0:
-            return
-        self._ensure_overlay_worker()
-        if self._overlay_queue is None:
-            return
-        interferer_boxes = list(getattr(self.tracker, "interferer_boxes", []) or [])
-        isc = getattr(self.tracker, "interferer_box_scores", None)
-        if isc is None:
-            interferer_scores = [None] * len(interferer_boxes)
-        else:
-            interferer_scores = list(isc)
-            while len(interferer_scores) < len(interferer_boxes):
-                interferer_scores.append(None)
-        last_box = (
-            list(self.tracker.last_box) if self.tracker.last_box is not None else None
-        )
-        target_score = getattr(self.tracker, "target_score", None)
-        scale = float(self.overlay_scale)
-        frame_payload = frame_bgr
-        if scale < 0.999:
-            h, w = frame_bgr.shape[:2]
-            out_w = max(1, int(round(w * scale)))
-            out_h = max(1, int(round(h * scale)))
-            sx = out_w / float(max(1, w))
-            sy = out_h / float(max(1, h))
-            frame_payload = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
-            interferer_boxes = [_scale_overlay_box(list(b), sx, sy) for b in interferer_boxes]
-            if last_box is not None:
-                last_box = _scale_overlay_box(list(last_box), sx, sy)
-        else:
-            frame_payload = frame_bgr.copy()
-        try:
-            self._overlay_queue.put_nowait(
-                (
-                    frame_payload,
-                    interferer_boxes,
-                    interferer_scores,
-                    last_box,
-                    target_score,
-                )
-            )
-        except queue.Full:
-            self._overlay_dropped_frames += 1
-
-    def _close_overlay_video_writer(self) -> None:
-        if self._overlay_queue is not None:
-            try:
-                self._overlay_queue.put_nowait(None)
-            except queue.Full:
-                self._overlay_queue.put(None)
-            if self._overlay_worker is not None:
-                self._overlay_worker.join(timeout=120.0)
-        if self._overlay_dropped_frames > 0:
-            print(f"[face overlay] dropped {self._overlay_dropped_frames} frames (queue full)")
-        self._overlay_queue = None
-        self._overlay_worker = None
-        self._overlay_video_frame_idx = 0
-        self._overlay_dropped_frames = 0
-
-    def print_rtf_profile(self, sum_sdk_s: float = 0.0, audio_dur_s: float = 0.0) -> None:
-        total = self._rtf_prof_face_s + self._rtf_prof_model_s + self._rtf_prof_align_s
-        if total <= 1e-9:
-            print("[rtf profile] no samples recorded")
-            return
-        sdk_overhead = sum_sdk_s - self._rtf_prof_stream_inference_s
-        si_other = self._rtf_prof_stream_inference_s - self._rtf_prof_face_s - self._rtf_prof_align_s - self._rtf_prof_model_s
-        if audio_dur_s > 1e-9:
-            rtf = sum_sdk_s / audio_dur_s
-            print(f"RTF(整体):       {rtf:.3f}  (sum_sdk={sum_sdk_s:.3f}s, audio_dur={audio_dur_s:.3f}s)")
-        print(f"  sumsdk(墙钟):   {sum_sdk_s:.3f} s")
-        print(f"  SDK(buffering): {sdk_overhead:.3f} s")
-        print(f"  face(MediaPipe): {self._rtf_prof_face_s:.3f} s")
-        print(f"  align:          {self._rtf_prof_align_s:.3f} s")
-        print(f"  model(总推理):   {self._rtf_prof_model_s:.3f} s")
-        if self._rtf_prof_ref_encoder_s > 1e-9 or self._rtf_prof_sep_s > 1e-9:
-            print(f"    ref_encoder(CPU ONNX): {self._rtf_prof_ref_encoder_s:.3f} s")
-            print(f"    sep_rknn(CPU ONNX):    {self._rtf_prof_sep_s:.3f} s")
-        print(f"  other(其他):    {si_other:.3f} s")
-        self._rtf_prof_face_s = 0.0
-        self._rtf_prof_model_s = 0.0
-        self._rtf_prof_align_s = 0.0
-        self._rtf_prof_ref_encoder_s = 0.0
-        self._rtf_prof_sep_s = 0.0
-        self._rtf_prof_stream_inference_s = 0.0
-
-    def reset(self, reopen_face_video: bool = True):
-        self._close_face_video_writer()
-        self._close_overlay_video_writer()
-        if self.face_detector == "mediapipe":
+    def reset(self):
+        if self.face_detector == "none":
+            self.tracker = None
+        elif self.face_detector == "mediapipe":
             from face_mediapipe_tracker import FaceMediaPipeStreamTracker
 
             ta = self._tracker_args
@@ -1477,12 +1245,8 @@ class AVStreamInference:
         self._started = True
         if hasattr(self.model, "clear_stream_cache"):
             self.model.clear_stream_cache()
-        if reopen_face_video and self.save_face_video_path:
-            self._open_face_video_writer(self.save_face_video_path, self._face_video_fps)
 
     def close(self):
-        self._close_face_video_writer()
-        self._close_overlay_video_writer()
         self._started = False
         if hasattr(self.model, "clear_stream_cache"):
             self.model.clear_stream_cache()
@@ -1507,33 +1271,11 @@ class AVStreamInference:
                 arr = librosa.resample(arr, orig_sr=sr_in, target_sr=int(self.audio_sr)).astype(np.float32, copy=False)
         return arr
 
-    def _normalize_video_chunk(self, video_chunk: Optional[Any]) -> List[np.ndarray]:
-        if video_chunk is None:
-            return []
-        if isinstance(video_chunk, list):
-            frames = video_chunk
-        else:
-            arr = np.asarray(video_chunk)
-            if arr.ndim == 3:
-                frames = [arr]
-            elif arr.ndim == 4:
-                frames = [arr[i] for i in range(arr.shape[0])]
-            else:
-                raise ValueError(f"video_chunk 必须是 list/3D/4D，当前={arr.shape}")
-        out: List[np.ndarray] = []
-        for frm in frames:
-            f = np.asarray(frm)
-            if f.ndim != 3 or int(f.shape[2]) != 3:
-                raise ValueError(f"单帧必须是 (H,W,3)，当前={f.shape}")
-            if f.dtype != np.uint8:
-                f = np.clip(f, 0, 255).astype(np.uint8)
-            out.append(f)
-        return out
-
-    def stream_inference(
+    def stream_inference_precropped(
         self,
         audio_chunk: Optional[np.ndarray] = None,
-        video_chunk: Optional[Any] = None,
+        precropped_video: Optional[List[np.ndarray]] = None,
+        face_valid: Optional[List[bool]] = None,
         is_start: bool = False,
         is_end: bool = False,
         flush_buffer: bool = False,
@@ -1541,35 +1283,24 @@ class AVStreamInference:
         video_fps: Optional[float] = None,
     ) -> List[np.ndarray]:
         if bool(is_start) or not self._started:
-            if bool(is_start):
-                if video_fps is not None and float(video_fps) > 1e-3:
-                    self._face_video_fps = float(video_fps)
-                else:
-                    self._face_video_fps = float(self.ref_sr)
-            self.reset(reopen_face_video=bool(is_start))
+            self.reset()
 
         sr_in = int(self.audio_sr if sampling_rate is None else sampling_rate)
         audio_in = self._normalize_audio_chunk(audio_chunk, sampling_rate=sr_in)
-        video_in = self._normalize_video_chunk(video_chunk)
-        t_total0 = time.perf_counter()
 
         new_faces: List[np.ndarray] = []
         src_face_valid: List[bool] = []
-        scene_switch_hits = 0
-        t_face0 = time.perf_counter()
-        for fbgr in video_in:
-            face_rgb, scene_switched = self.tracker.process_bgr(
-                fbgr,
-                scene_switch_iou_thr=float(self.scene_switch_iou_thr),
-            )
-            new_faces.append(face_rgb)
-            src_face_valid.append(self.tracker.last_box is not None)
-            self._write_face_frame(face_rgb)
-            self._write_overlay_frame(fbgr)
-            scene_switch_hits += int(scene_switched)
-        self._rtf_prof_face_s += time.perf_counter() - t_face0
-        if int(self.clear_cache_on_scene_switch) != 0 and scene_switch_hits > 0 and hasattr(self.model, "clear_stream_cache"):
-            self.model.clear_stream_cache()
+        if precropped_video:
+            if face_valid is None:
+                face_valid = [True] * len(precropped_video)
+            elif len(face_valid) != len(precropped_video):
+                raise ValueError("face_valid length must match precropped_video")
+            for crop, ok in zip(precropped_video, face_valid):
+                c = np.asarray(crop, dtype=np.float32)
+                if c.ndim != 3 or c.shape[2] != 3:
+                    raise ValueError(f"precropped frame must be (H,W,3), got {c.shape}")
+                new_faces.append(c)
+                src_face_valid.append(bool(ok))
 
         if new_faces:
             self.resampler.append_src_faces_rgb255(new_faces, src_face_valid)
@@ -1580,9 +1311,6 @@ class AVStreamInference:
                 else audio_in.astype(np.float32, copy=False)
             )
 
-        # Keep ring buffers bounded to avoid unbounded growth on long streams.
-        # - stream-cache mode: trim both external ring and model internal caches.
-        # - non-stream-cache mode (e.g. most TorchScript exports): trim only external ring.
         if (not self.use_stream_cache) and self.audio_buf.size > self.max_history_samples:
             n_drop_audio = int(self.audio_buf.size) - int(self.max_history_samples)
             if n_drop_audio > 0:
@@ -1593,7 +1321,6 @@ class AVStreamInference:
                     self.resampler.trim_head(n_drop_ref)
                 self.produced_samples = max(0, int(self.produced_samples) - n_drop_audio)
 
-        # In stream-cache mode, keep ring buffer bounded and trim model caches in sync.
         if self.use_stream_cache and self.audio_buf.size > self.max_history_samples:
             excess = int(self.audio_buf.size) - int(self.max_history_samples)
             units = excess // self.drop_unit_samples
@@ -1620,7 +1347,6 @@ class AVStreamInference:
             tfv = self.resampler.tgt_face_valid
             if len(tfv) != len(self.resampler.tgt_frames):
                 raise RuntimeError("internal: tgt_face_valid length mismatch vs tgt_frames")
-            t_align0 = time.perf_counter()
             wav_off, vid_off, fv_off = _apply_av_offset_with_valid(
                 self.audio_buf,
                 self.resampler.tgt_frames,
@@ -1632,8 +1358,6 @@ class AVStreamInference:
             wav_al, vid_list_al, fv_al = _align_audio_video_list_with_valid(
                 wav_off, vid_off, fv_off, self.audio_sr, self.ref_sr
             )
-            self._rtf_prof_align_s += time.perf_counter() - t_align0
-            # stream-cache: 必须与 fv_al 同长的对齐后视频，不能用未裁剪的 tgt_video_np()
             if self.use_stream_cache:
                 if len(vid_list_al) > 0:
                     vid_for_model = np.stack(vid_list_al, axis=0).astype(np.float32, copy=False)
@@ -1650,7 +1374,6 @@ class AVStreamInference:
                 )
             available = int(wav_al.shape[0]) - int(self.produced_samples)
             if available >= int(self.hop_samples) or (do_flush and available > 0):
-                t_model0 = time.perf_counter()
                 new_segs, self.produced_samples = _run_new_hops_nonoverlap(
                     wav_al,
                     vid_for_model,
@@ -1665,18 +1388,10 @@ class AVStreamInference:
                     use_stream_cache=self.use_stream_cache,
                     vid_face_valid=fv_al,
                 )
-                self._rtf_prof_model_s += time.perf_counter() - t_model0
-                if hasattr(self.model, "get_and_reset_profiling"):
-                    ref_s, sep_s = self.model.get_and_reset_profiling()
-                    self._rtf_prof_ref_encoder_s += ref_s
-                    self._rtf_prof_sep_s += sep_s
                 if new_segs:
                     outputs.extend([seg.astype(np.float32, copy=False) for seg in new_segs])
 
         if bool(is_end):
-            self._close_face_video_writer()
-            self._close_overlay_video_writer()
-            self.reset(reopen_face_video=False)
-        self._rtf_prof_stream_inference_s += time.perf_counter() - t_total0
+            self.reset()
         return outputs
 
