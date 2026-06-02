@@ -23,9 +23,11 @@ class FaceMediaPipeStreamTracker:
     def __init__(
         self,
         crop_size: int = 128,
-        face_scale: float = 1.25,
+        face_scale: float = 1.0,
         detect_every_n: int = 5,
+        detect_max_side: int = 320,
         box_smooth_alpha: float = 0.85,
+        score_smooth_alpha: float = 0.5,
         model_path: str = "detector.tflite",
         min_detection_confidence: float = 0.5,
         use_lip_center_crop: bool = False,
@@ -43,7 +45,9 @@ class FaceMediaPipeStreamTracker:
         self.crop_size = int(crop_size)
         self.face_scale = float(face_scale)
         self.detect_every_n = max(1, int(detect_every_n))
+        self.detect_max_side = int(detect_max_side)
         self.box_smooth_alpha = float(np.clip(box_smooth_alpha, 0.0, 1.0))
+        self.score_smooth_alpha = float(np.clip(score_smooth_alpha, 0.0, 1.0))
         self.use_lip_center_crop = bool(use_lip_center_crop)
         self._mouth_keypoint_indices = tuple(int(i) for i in mouth_keypoint_indices)
         self.lip_crop_scale = float(lip_crop_scale)
@@ -117,19 +121,30 @@ class FaceMediaPipeStreamTracker:
     def _detect_all_boxes(
         self, frame_bgr: np.ndarray
     ) -> Tuple[Optional[np.ndarray], Optional[float], List[Tuple[List[float], Optional[float]]], Optional[np.ndarray]]:
+        h, w = frame_bgr.shape[:2]
+        sx = sy = 1.0
+        if self.detect_max_side > 0:
+            ms = max(h, w)
+            if ms > self.detect_max_side:
+                scale = float(self.detect_max_side) / float(ms)
+                sw = max(1, int(round(w * scale)))
+                sh = max(1, int(round(h * scale)))
+                frame_bgr = cv2.resize(frame_bgr, (sw, sh), interpolation=cv2.INTER_AREA)
+                sx = w / float(sw)
+                sy = h / float(sh)
+
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self._detector.detect(mp_image)
         if not result.detections:
             return None, None, [], None
-        h, w = frame_bgr.shape[:2]
         boxes: List[Tuple[float, np.ndarray, Optional[float], Optional[np.ndarray]]] = []
         for det in result.detections:
             bb = det.bounding_box
-            x1 = int(bb.origin_x)
-            y1 = int(bb.origin_y)
-            x2 = int(bb.origin_x + bb.width)
-            y2 = int(bb.origin_y + bb.height)
+            x1 = int(round(bb.origin_x * sx))
+            y1 = int(round(bb.origin_y * sy))
+            x2 = int(round((bb.origin_x + bb.width) * sx))
+            y2 = int(round((bb.origin_y + bb.height) * sy))
             sq = self._bbox_to_square_xyxy(x1, y1, x2, y2, self.face_scale, w, h)
             area = float(max(0.0, sq[2] - sq[0]) * max(0.0, sq[3] - sq[1]))
             sc = _mediapipe_detection_score(det)
@@ -174,7 +189,12 @@ class FaceMediaPipeStreamTracker:
                     if float(iou) < float(scene_switch_iou_thr):
                         scene_switched = True
                 self.last_detected_box = new_box.copy()
-                self.target_score = det_target_score
+                if det_target_score is not None:
+                    if self.target_score is None or self.score_smooth_alpha >= 0.999:
+                        self.target_score = float(det_target_score)
+                    else:
+                        self.target_score = (self.score_smooth_alpha * self.target_score +
+                                             (1.0 - self.score_smooth_alpha) * float(det_target_score))
                 if self.last_box is None or self.box_smooth_alpha >= 0.999:
                     self.last_box = new_box.tolist()
                 else:

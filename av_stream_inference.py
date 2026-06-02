@@ -376,7 +376,7 @@ def pick_target_detection(
     frame_w: int,
     frame_h: int,
     policy: str = "largest",
-    area_ratio_thr: float = 0.85,
+    area_ratio_thr: float = 0.95,
     locked_box: Optional[np.ndarray] = None,
     lock_min_iou: float = 0.15,
 ) -> int:
@@ -433,7 +433,7 @@ class FaceHaarStreamTracker:
     def __init__(
         self,
         crop_size=128,
-        face_scale=1.25,
+        face_scale=1.0,
         detect_every_n=5,
         detect_max_side=320,
         haar_scale_factor=1.15,

@@ -141,6 +141,8 @@ class StreamProcessor:
         self._acc_audio_buf: np.ndarray = np.array([], dtype=np.float32)
         self._acc_crops: list = []
         self._acc_fv: List[bool] = []
+        self._acc_face_boxes: List[Optional[List[float]]] = []
+        self._acc_face_box_colors: List[Optional[Tuple[int, int, int]]] = []
         self._first_face_chunk = True
 
         # Crop recording
@@ -148,6 +150,7 @@ class StreamProcessor:
 
         # Timing
         self._total_infer_audio_samples = 0
+        self._sum_face_detection_s = 0.0
         self._sum_inference_s = 0.0
 
     @property
@@ -158,13 +161,24 @@ class StreamProcessor:
     def sum_inference_s(self) -> float:
         return self._sum_inference_s
 
+    @property
+    def sum_face_detection_s(self) -> float:
+        return self._sum_face_detection_s
+
+    @property
+    def sum_total_s(self) -> float:
+        return self._sum_face_detection_s + self._sum_inference_s
+
     def reset(self) -> None:
         self._acc_audio_buf = np.array([], dtype=np.float32)
         self._acc_crops = []
         self._acc_fv = []
+        self._acc_face_boxes = []
+        self._acc_face_box_colors = []
         self._first_face_chunk = True
         self._recorded_crops = []
         self._total_infer_audio_samples = 0
+        self._sum_face_detection_s = 0.0
         self._sum_inference_s = 0.0
 
     def get_recorded_crops(self) -> list:
@@ -173,6 +187,23 @@ class StreamProcessor:
         Returns:
             list of (list of np.ndarray): 每个元素是一个窗口的 crops，float32 RGB。"""
         return self._recorded_crops
+
+    def get_face_boxes(self) -> List[Optional[List[float]]]:
+        """返回逐帧 Active_Target 人脸框（按 feed_chunk 喂入顺序）。
+
+        Returns:
+            List where entry i is [x1, y1, x2, y2] or None.
+        """
+        return list(self._acc_face_boxes)
+
+    def get_face_box_colors(self) -> List[Optional[Tuple[int, int, int]]]:
+        """返回逐帧 BGR 框颜色，与 get_face_boxes() 对齐。
+
+        Returns:
+            List where entry i is (B, G, R) or None.
+            None 表示无人脸或置信度 < 0.6，调用方应使用默认颜色。
+        """
+        return list(self._acc_face_box_colors)
 
     def feed_chunk(
         self,
@@ -189,7 +220,9 @@ class StreamProcessor:
             wav = wav[np.newaxis, :]
         wav = wav.astype(np.float32, copy=False)
 
+        t_face0 = time.perf_counter()
         r = self._preprocessor.process_chunk(video_frames)
+        self._sum_face_detection_s += time.perf_counter() - t_face0
 
         self._acc_audio_buf = (
             np.concatenate([self._acc_audio_buf, wav], axis=1)
@@ -198,6 +231,8 @@ class StreamProcessor:
         )
         self._acc_crops.extend(r["crops"])
         self._acc_fv.extend(r["face_valid"])
+        self._acc_face_boxes.extend(r.get("face_boxes", []))
+        self._acc_face_box_colors.extend(r.get("face_box_colors", []))
 
         outputs_all: list = []
 
