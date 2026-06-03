@@ -37,10 +37,10 @@ def main():
     parser.add_argument(
         "--type",
         choices=["torch", "onnx", "onnx_quant_dynamic", "torch_jit", "torch_jit_fp16"],
-        default="torch",
+        default="onnx",
         help="推理后端: torch, onnx(FP32), onnx_quant_dynamic(INT8), torch_jit, torch_jit_fp16",
     )
-    parser.add_argument("--infer_chunk_ms", type=float, default=200.0, help="推理hop时长(ms)")
+    parser.add_argument("--infer_chunk_ms", type=float, default=500.0, help="推理hop时长(ms)")
     parser.add_argument("--context_ms", type=float, default=100.0, help="左上下文时长(ms)")
     parser.add_argument("--max_history_ms", type=float, default=100.0, help="ring buffer最大历史(ms)")
     parser.add_argument("--use_stream_cache", type=int, default=1, help="1=full-buffer 推理, 0=逐 hop 滑窗")
@@ -58,13 +58,13 @@ def main():
     parser.add_argument(
         "--ref_onnx_path",
         type=str,
-        default="",
+        default="checkpoints/AV_Mossformer/av_mossformer_ref_fixed.onnx",
         help="RKNN 拆分部署：ORT ref_encoder（灰度 4D），与 --sep_onnx_path 同时使用",
     )
     parser.add_argument(
         "--sep_onnx_path",
         type=str,
-        default="",
+        default="checkpoints/AV_Mossformer/av_mossformer_sep_rknn.onnx",
         help="RKNN 拆分部署：ORT separator（mixture+ref_feat），与 --ref_onnx_path 同时使用",
     )
     parser.add_argument(
@@ -110,13 +110,20 @@ def main():
     parser.add_argument(
         "--score_smooth_alpha",
         type=float,
-        default=0.5,
-        help="置信度分数平滑系数 (0~1)，越小响应越快 (默认 0.5)",
+        default=0.8,
+        help="置信度分数平滑系数 (0~1)，越小响应越快 (默认 0.8)",
+    )
+    parser.add_argument(
+        "--box_smooth_alpha",
+        type=float,
+        default=0,
+        help="人脸框平滑系数 (0~1)，越小框越跟手但越抖；快速转头建议 0.3~0.5 (默认 0)",
     )
     parser.add_argument(
         "--annotate",
         action="store_true",
-        help="推理完成后输出带人脸框的标注视频",
+        default=True,
+        help="推理完成后输出带人脸框的标注视频（默认开启）",
     )
     parser.add_argument(
         "--annotate_dir",
@@ -127,7 +134,8 @@ def main():
     parser.add_argument(
         "--face-only",
         action="store_true",
-        help="仅测试人脸检测，跳过模型加载和推理，自动输出标注视频",
+        default=False,
+        help="仅测试人脸检测，跳过模型加载和推理，自动输出标注视频（默认开启）",
     )
     parser.add_argument(
         "--face_detector_model",
@@ -166,29 +174,28 @@ def main():
         help="MediaPipe 检测前降采样的最大边长（像素），0=不降采样",
     )
     parser.add_argument(
-        "--face_target_policy",
-        choices=["largest", "center", "center_largest", "center_largest_lock"],
-        default="center_largest_lock",
-        help="多人脸时选目标: largest/center/center_largest; center_largest_lock=居中初选后锁定",
-    )
-    parser.add_argument(
-        "--face_target_lock",
-        type=int,
-        choices=[0, 1],
-        default=1,
-        help="1=首帧按 policy 选人后按 IoU 锁定同一人(默认); 0=每帧重选",
-    )
-    parser.add_argument(
-        "--face_target_lock_min_iou",
-        type=float,
-        default=0.15,
-        help="锁定模式下与上一目标框 IoU 低于此值则不切换目标(保持上一帧)",
-    )
-    parser.add_argument(
         "--min_detection_confidence",
         type=float,
         default=0.5,
         help="MediaPipe 人脸检测最低置信度阈值 (0~1)，低于此值的检测结果被丢弃，框颜色为黄色/红色 (默认 0.5)",
+    )
+    parser.add_argument(
+        "--area_switch_ratio",
+        type=float,
+        default=1.2,
+        help="面积切换阈值：Candidate面积 > ratio * Active_Target面积 时触发候选 (默认 1.2)",
+    )
+    parser.add_argument(
+        "--area_switch_min_frames",
+        type=int,
+        default=30,
+        help="面积切换持续帧数：候选状态持续超过此帧数才切换 (~1s@25fps, 默认 25)",
+    )
+    parser.add_argument(
+        "--area_switch_min_confidence",
+        type=float,
+        default=0.6,
+        help="面积切换条件3-1：Active_Target置信度低于此值才允许切换 (默认 0.6)",
     )
     parser.add_argument(
         "--files",
@@ -214,9 +221,6 @@ def main():
         mediapipe_lip_crop_scale=float(args.mediapipe_lip_crop_scale),
         mediapipe_lip_crop_min_px=int(args.mediapipe_lip_crop_min_px),
         mediapipe_lip_crop_max_px=int(args.mediapipe_lip_crop_max_px),
-        face_target_policy=str(args.face_target_policy),
-        face_target_lock=int(args.face_target_lock),
-        face_target_lock_min_iou=float(args.face_target_lock_min_iou),
     )
     if not args.face_only:
         if args.type in ("onnx", "onnx_quant_dynamic"):
@@ -252,43 +256,52 @@ def main():
     out_wav = "./测试结果"
     # audio_dir = "./测试用例/音频"
     # video_dir = "./测试用例/视频"
-    audio_dir = "./测试用例/测试用例/audio_wav"
-    video_dir = "./测试用例/测试用例/video"
+    audio_dir = "./测试用例/特殊人脸切换示例"
+    video_dir = "./测试用例/特殊人脸切换示例"
 
     out_dir = out_wav
     os.makedirs(out_dir, exist_ok=True)
 
-    if os.path.isdir(audio_dir):
-        audio_files = sorted([f for f in os.listdir(audio_dir) if f.endswith(".wav")])
-    elif os.path.isfile(audio_dir):
-        audio_files = [os.path.basename(audio_dir)]
-        audio_dir = os.path.dirname(audio_dir) or "."
-    else:
-        raise FileNotFoundError(f"audio path not found: {audio_dir}")
-    total_files = len(audio_files)
-
-    for idx, audio_name in enumerate(audio_files):
-        base_name = os.path.splitext(audio_name)[0]
-        if file_filter and base_name not in file_filter:
-            continue
-        audio_path = os.path.join(audio_dir, audio_name)
+    if args.face_only:
+        # 人脸检测模式：遍历视频文件，音频可选
         if os.path.isdir(video_dir):
-            video_path = os.path.join(video_dir, base_name + ".mp4")
+            source_files = sorted([f for f in os.listdir(video_dir) if f.endswith(".mp4")])
         elif os.path.isfile(video_dir):
-            video_path = video_dir
+            source_files = [os.path.basename(video_dir)]
+            video_dir = os.path.dirname(video_dir) or "."
         else:
             raise FileNotFoundError(f"video path not found: {video_dir}")
+    else:
+        if os.path.isdir(audio_dir):
+            source_files = sorted([f for f in os.listdir(audio_dir) if f.endswith(".wav")])
+        elif os.path.isfile(audio_dir):
+            source_files = [os.path.basename(audio_dir)]
+            audio_dir = os.path.dirname(audio_dir) or "."
+        else:
+            raise FileNotFoundError(f"audio path not found: {audio_dir}")
+    total_files = len(source_files)
 
+    for idx, src_name in enumerate(source_files):
+        base_name = os.path.splitext(src_name)[0]
+        if file_filter and base_name not in file_filter:
+            continue
+        video_path = os.path.join(video_dir, base_name + ".mp4") if os.path.isdir(video_dir) else video_dir
         if not os.path.exists(video_path):
-            print(f"跳过 {audio_name}：找不到对应视频 {video_path}")
+            print(f"跳过 {base_name}：找不到对应视频 {video_path}")
             continue
 
         print(f"\n===== 处理 [{idx+1}/{total_files}]: {base_name} =====")
 
-        wav_file, sr_file = sf.read(audio_path, dtype="float32", always_2d=True)  # [T,C]
-        wav = wav_file.T  # -> [C,T]
         frames, fps = _load_video_frames_bgr(video_path)
-        sr = int(sr_file)
+
+        if not args.face_only:
+            audio_path = os.path.join(audio_dir, base_name + ".wav")
+            if not os.path.exists(audio_path):
+                print(f"跳过 {base_name}：找不到对应音频 {audio_path}")
+                continue
+            wav_file, sr_file = sf.read(audio_path, dtype="float32", always_2d=True)  # [T,C]
+            wav = wav_file.T  # -> [C,T]
+            sr = int(sr_file)
 
         # === Part 1: 输入层 — 按 chunk_ms 切分整段文件，模拟流式输入 ===
         chunk_ms = float(args.chunk_ms)
@@ -303,26 +316,34 @@ def main():
                 detect_every_n=int(args.detect_every_n),
                 detect_max_side=int(args.mediapipe_detect_max_side),
                 score_smooth_alpha=float(args.score_smooth_alpha),
+                box_smooth_alpha=float(args.box_smooth_alpha),
                 min_detection_confidence=float(args.min_detection_confidence),
                 use_lip_center_crop=bool(int(args.mediapipe_lip_crop)),
                 lip_crop_scale=float(args.mediapipe_lip_crop_scale),
                 lip_crop_min_px=int(args.mediapipe_lip_crop_min_px),
                 lip_crop_max_px=int(args.mediapipe_lip_crop_max_px),
-                target_policy=str(args.face_target_policy),
-                target_lock=bool(int(args.face_target_lock)),
-                target_lock_min_iou=float(args.face_target_lock_min_iou),
+                area_switch_ratio=float(args.area_switch_ratio),
+                area_switch_min_frames=int(args.area_switch_min_frames),
+                area_switch_min_confidence=float(args.area_switch_min_confidence),
             )
             num_chunks = (len(frames) + v_per_chunk - 1) // v_per_chunk
             all_face_boxes: list = []
             all_face_box_colors: list = []
+            face_s = 0.0
             for ci in range(num_chunks):
                 v_start = ci * v_per_chunk
                 v_frames = frames[v_start : v_start + v_per_chunk]
                 if not v_frames:
                     break
+                t0 = time.perf_counter()
                 r = preprocessor.process_chunk(v_frames)
+                face_s += time.perf_counter() - t0
                 all_face_boxes.extend(r["face_boxes"])
                 all_face_box_colors.extend(r["face_box_colors"])
+
+            video_dur_s = len(frames) / fps if fps > 1e-9 else 0.0
+            face_rtf = face_s / video_dur_s if video_dur_s > 1e-9 else float("nan")
+            print(f"人脸检测RTF: {face_rtf:.3f}  (face={face_s:.3f}s, video={video_dur_s:.3f}s, frames={len(frames)})")
 
             if all_face_boxes and any(b is not None for b in all_face_boxes):
                 annotate_dir = str(args.annotate_dir)
@@ -358,14 +379,16 @@ def main():
             detect_every_n=int(args.detect_every_n),
             detect_max_side=int(args.mediapipe_detect_max_side),
             face_scale=float(args.face_scale),
+            score_smooth_alpha=float(args.score_smooth_alpha),
+            box_smooth_alpha=float(args.box_smooth_alpha),
             min_detection_confidence=float(args.min_detection_confidence),
             use_lip_center_crop=bool(int(args.mediapipe_lip_crop)),
             lip_crop_scale=float(args.mediapipe_lip_crop_scale),
             lip_crop_min_px=int(args.mediapipe_lip_crop_min_px),
             lip_crop_max_px=int(args.mediapipe_lip_crop_max_px),
-            target_policy=str(args.face_target_policy),
-            target_lock=bool(int(args.face_target_lock)),
-            target_lock_min_iou=float(args.face_target_lock_min_iou),
+            area_switch_ratio=float(args.area_switch_ratio),
+            area_switch_min_frames=int(args.area_switch_min_frames),
+            area_switch_min_confidence=float(args.area_switch_min_confidence),
         )
 
         # === Part 2+3: StreamProcessor ===
@@ -447,7 +470,8 @@ def main():
         infer_s = processor.sum_inference_s
         total_s = processor.sum_total_s
         rtf = total_s / audio_dur_s if audio_dur_s > 1e-9 else float("nan")
-        print(f"RTF: {rtf:.3f}  (face={face_s:.3f}s + infer={infer_s:.3f}s = {total_s:.3f}s, audio={audio_dur_s:.3f}s)")
+        face_rtf = face_s / audio_dur_s if audio_dur_s > 1e-9 else float("nan")
+        print(f"RTF: {rtf:.3f}  (face={face_s:.3f}s / face_rtf={face_rtf:.3f}, infer={infer_s:.3f}s, total={total_s:.3f}s, audio={audio_dur_s:.3f}s)")
 
         if outputs_all:
             out_audio = np.concatenate(outputs_all, axis=0).astype(np.float32, copy=False)

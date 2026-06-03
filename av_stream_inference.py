@@ -12,6 +12,7 @@ import torch
 import yaml
 import math
 
+from visual_preprocessor import _box_iou_xyxy, pick_target_detection
 from networks import network_wrapper
 
 
@@ -350,83 +351,6 @@ def _load_model_weights(model, ckpt_path):
     model.load_state_dict(state)
 
 
-def _box_iou_xyxy(box_a: np.ndarray, box_b: np.ndarray) -> float:
-    ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
-    bx1, by1, bx2, by2 = [float(v) for v in box_b]
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    den = area_a + area_b - inter
-    return (inter / den) if den > 1e-9 else 0.0
-
-
-def _normalize_face_target_policy(policy: str) -> str:
-    pol = str(policy).lower().strip()
-    if pol.endswith("_lock"):
-        return pol[: -len("_lock")]
-    return pol
-
-
-def pick_target_detection(
-    boxes: Sequence[Tuple[float, np.ndarray, Optional[float], Optional[np.ndarray]]],
-    frame_w: int,
-    frame_h: int,
-    policy: str = "largest",
-    area_ratio_thr: float = 0.95,
-    locked_box: Optional[np.ndarray] = None,
-    lock_min_iou: float = 0.15,
-) -> int:
-    """从多人脸检测候选中选目标索引。元素为 (area, box_xyxy, score|None, lip_xy|None)。
-
-    若提供 locked_box，则在候选中选与锁定框 IoU 最大者；若最大 IoU < lock_min_iou 则返回 -1（保持上一帧目标）。
-    """
-    if not boxes:
-        return 0
-    pol = _normalize_face_target_policy(policy)
-
-    if locked_box is not None:
-        locked = np.asarray(locked_box, dtype=np.float32).reshape(-1)
-        best_i = 0
-        best_iou = -1.0
-        for i, b in enumerate(boxes):
-            iou = _box_iou_xyxy(locked, b[1])
-            if iou > best_iou:
-                best_iou = iou
-                best_i = i
-        if float(best_iou) >= float(lock_min_iou):
-            return int(best_i)
-        return -1
-
-    if pol == "largest":
-        return int(max(range(len(boxes)), key=lambda i: float(boxes[i][0])))
-
-    cx_img = float(frame_w) * 0.5
-    cy_img = float(frame_h) * 0.5
-
-    def _center_dist_sq(i: int) -> float:
-        box = boxes[i][1]
-        cx = (float(box[0]) + float(box[2])) * 0.5
-        cy = (float(box[1]) + float(box[3])) * 0.5
-        return (cx - cx_img) ** 2 + (cy - cy_img) ** 2
-
-    if pol == "center":
-        return int(min(range(len(boxes)), key=_center_dist_sq))
-
-    if pol == "center_largest":
-        max_area = max(float(b[0]) for b in boxes)
-        thr = float(area_ratio_thr) * max_area
-        candidates = [i for i, b in enumerate(boxes) if float(b[0]) >= thr - 1e-6]
-        if not candidates:
-            candidates = list(range(len(boxes)))
-        return int(min(candidates, key=_center_dist_sq))
-
-    raise ValueError(f"unsupported face target policy: {policy!r}")
-
-
 class FaceHaarStreamTracker:
     """流式人脸框跟踪：OpenCV Haar + 平滑。"""
 
@@ -439,13 +363,7 @@ class FaceHaarStreamTracker:
         haar_scale_factor=1.15,
         haar_min_neighbors=4,
         box_smooth_alpha=0.85,
-        target_policy: str = "center_largest",
-        target_lock: bool = True,
-        target_lock_min_iou: float = 0.15,
     ):
-        self.target_policy = str(target_policy).lower().strip()
-        self.target_lock = bool(target_lock) or self.target_policy.endswith("_lock")
-        self.target_lock_min_iou = float(target_lock_min_iou)
         self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         if self.detector.empty():
             raise RuntimeError("加载 OpenCV haarcascade 失败")
@@ -465,15 +383,9 @@ class FaceHaarStreamTracker:
 
     _box_iou_xyxy = staticmethod(_box_iou_xyxy)
 
-    def _locked_box_for_pick(self) -> Optional[np.ndarray]:
-        if not self.target_lock:
-            return None
-        return self.last_detected_box
-
-    def process_bgr(self, frame_bgr: np.ndarray, scene_switch_iou_thr: float = 0.15) -> Tuple[np.ndarray, bool]:
+    def process_bgr(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, bool]:
         h, w = frame_bgr.shape[:2]
         run_det = (self.frame_idx % self.detect_every_n == 0) or (self.last_box is None)
-        scene_switched = False
         self.interferer_boxes = []
         self.interferer_box_scores = []
 
@@ -514,24 +426,13 @@ class FaceHaarStreamTracker:
                     box = np.array([x1, y1, x2, y2], dtype=np.float32)
                     area = float(max(0.0, x2 - x1) * max(0.0, y2 - y1))
                     scaled_boxes.append((area, box, None, None))
-                ti = pick_target_detection(
-                    scaled_boxes,
-                    w,
-                    h,
-                    policy=self.target_policy,
-                    locked_box=self._locked_box_for_pick(),
-                    lock_min_iou=self.target_lock_min_iou,
-                )
+                ti = pick_target_detection(scaled_boxes, w, h)
                 if ti >= 0:
                     new_box = scaled_boxes[ti][1]
                     self.interferer_boxes = [
                         scaled_boxes[i][1].tolist() for i in range(len(scaled_boxes)) if i != ti
                     ]
                     self.interferer_box_scores = [None] * len(self.interferer_boxes)
-                    if self.last_detected_box is not None and not self.target_lock:
-                        iou = self._box_iou_xyxy(self.last_detected_box, new_box)
-                        if float(iou) < float(scene_switch_iou_thr):
-                            scene_switched = True
                     self.last_detected_box = new_box.copy()
                     self.target_score = None
                     if self.last_box is None or self.box_smooth_alpha >= 0.999:
@@ -550,7 +451,7 @@ class FaceHaarStreamTracker:
 
         if self.last_box is None:
             self.frame_idx += 1
-            return np.zeros((self.crop_size, self.crop_size, 3), dtype=np.float32), bool(scene_switched)
+            return np.zeros((self.crop_size, self.crop_size, 3), dtype=np.float32), False
 
         x1, y1, x2, y2 = self.last_box
         x1 = int(round(max(0, min(w - 1, float(x1)))))
@@ -567,7 +468,7 @@ class FaceHaarStreamTracker:
         crop = cv2.resize(crop, (self.crop_size, self.crop_size), interpolation=cv2.INTER_AREA)
         crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         self.frame_idx += 1
-        return crop.astype(np.float32), bool(scene_switched)
+        return crop.astype(np.float32), False
 
 
 def _draw_overlay_box_with_label(
@@ -1023,14 +924,8 @@ class AVStreamInference:
         mediapipe_lip_crop_scale: float = 0.55,
         mediapipe_lip_crop_min_px: int = 48,
         mediapipe_lip_crop_max_px: int = 2048,
-        face_target_policy: str = "center_largest",
-        face_target_lock: int = 1,
-        face_target_lock_min_iou: float = 0.15,
     ):
         self.backend_kind = "torch"
-        self.face_target_policy = str(face_target_policy).lower().strip()
-        self.face_target_lock = bool(int(face_target_lock))
-        self.face_target_lock_min_iou = float(face_target_lock_min_iou)
         self.face_detector = str(face_detector).lower()
         self.face_detector_model_path = str(face_detector_model_path)
         self.mediapipe_use_lip_center_crop = bool(int(mediapipe_use_lip_center_crop))
@@ -1201,9 +1096,6 @@ class AVStreamInference:
             haar_scale_factor=float(haar_scale_factor),
             haar_min_neighbors=int(haar_min_neighbors),
             box_smooth_alpha=float(face_box_smooth_alpha),
-            target_policy=self.face_target_policy,
-            target_lock=self.face_target_lock,
-            target_lock_min_iou=self.face_target_lock_min_iou,
         )
         self._started = False
         self.reset()
@@ -1212,7 +1104,7 @@ class AVStreamInference:
         if self.face_detector == "none":
             self.tracker = None
         elif self.face_detector == "mediapipe":
-            from face_mediapipe_tracker import FaceMediaPipeStreamTracker
+            from visual_preprocessor import FaceMediaPipeStreamTracker
 
             ta = self._tracker_args
             self.tracker = FaceMediaPipeStreamTracker(
@@ -1225,9 +1117,6 @@ class AVStreamInference:
                 lip_crop_scale=self.mediapipe_lip_crop_scale,
                 lip_crop_min_px=self.mediapipe_lip_crop_min_px,
                 lip_crop_max_px=self.mediapipe_lip_crop_max_px,
-                target_policy=ta.get("target_policy", "center_largest"),
-                target_lock=ta.get("target_lock", True),
-                target_lock_min_iou=ta.get("target_lock_min_iou", 0.15),
             )
         else:
             self.tracker = FaceHaarStreamTracker(**self._tracker_args)

@@ -37,9 +37,6 @@ class StreamInferenceSDK:
         mediapipe_lip_crop_scale: float = 0.55,
         mediapipe_lip_crop_min_px: int = 48,
         mediapipe_lip_crop_max_px: int = 2048,
-        face_target_policy: str = "center_largest",
-        face_target_lock: int = 1,
-        face_target_lock_min_iou: float = 0.15,
     ):
         self.default_fps = float(default_fps)
         self._infer_chunk_ms = float(infer_chunk_ms)
@@ -63,9 +60,6 @@ class StreamInferenceSDK:
             mediapipe_lip_crop_scale=float(mediapipe_lip_crop_scale),
             mediapipe_lip_crop_min_px=int(mediapipe_lip_crop_min_px),
             mediapipe_lip_crop_max_px=int(mediapipe_lip_crop_max_px),
-            face_target_policy=str(face_target_policy),
-            face_target_lock=int(face_target_lock),
-            face_target_lock_min_iou=float(face_target_lock_min_iou),
         )
 
     @staticmethod

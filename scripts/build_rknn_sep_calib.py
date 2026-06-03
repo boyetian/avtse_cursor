@@ -188,7 +188,7 @@ def _load_bgr_frames_uint8(mp4_path: str, ref_sr: float) -> tuple[list[np.ndarra
 
 
 def _make_mediapipe_tracker(vcfg: VideoPreprocessConfig):
-    from face_mediapipe_tracker import FaceMediaPipeStreamTracker
+    from visual_preprocessor import FaceMediaPipeStreamTracker
 
     model_path = vcfg.face_detector_model
     if not os.path.isabs(model_path):

@@ -65,7 +65,7 @@ def create_tracker(
     target_lock_min_iou: float = 0.15,
 ):
     if face_detector == "mediapipe":
-        from face_mediapipe_tracker import FaceMediaPipeStreamTracker
+        from visual_preprocessor import FaceMediaPipeStreamTracker
 
         return FaceMediaPipeStreamTracker(
             detect_every_n=detect_every_n,
