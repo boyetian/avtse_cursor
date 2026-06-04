@@ -48,7 +48,7 @@ class VideoPreprocessConfig:
     image_size: int = 96
     ref_sr: float = 30.0
     use_mediapipe_lip: bool = True
-    face_detector_model: str = "detector.tflite"
+    face_detector_model: str = "blaze_face_full_range.tflite"
     mediapipe_lip_crop_scale: float = 0.8
     mediapipe_lip_crop_min_px: int = 48
     mediapipe_lip_crop_max_px: int = 2048
@@ -188,7 +188,7 @@ def _load_bgr_frames_uint8(mp4_path: str, ref_sr: float) -> tuple[list[np.ndarra
 
 
 def _make_mediapipe_tracker(vcfg: VideoPreprocessConfig):
-    from visual_preprocessor import FaceMediaPipeStreamTracker
+    from face_detector import FaceMediaPipeStreamTracker
 
     model_path = vcfg.face_detector_model
     if not os.path.isabs(model_path):
@@ -744,7 +744,7 @@ def main() -> int:
     parser.add_argument(
         "--face-detector-model",
         type=str,
-        default="detector.tflite",
+        default="blaze_face_full_range.tflite",
         help="MediaPipe face model (relative to AV_TSE root)",
     )
     parser.add_argument(

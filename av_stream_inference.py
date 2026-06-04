@@ -12,7 +12,7 @@ import torch
 import yaml
 import math
 
-from visual_preprocessor import _box_iou_xyxy, pick_target_detection
+from face_detector import _box_iou_xyxy, pick_target_detection
 from networks import network_wrapper
 
 
@@ -919,7 +919,7 @@ class AVStreamInference:
         use_stream_cache: int = 1,
         max_history_ms: float = 200.0,
         face_detector: str = "haar",
-        face_detector_model_path: str = "detector.tflite",
+        face_detector_model_path: str = "blaze_face_full_range.tflite",
         mediapipe_use_lip_center_crop: int = 0,
         mediapipe_lip_crop_scale: float = 0.55,
         mediapipe_lip_crop_min_px: int = 48,
@@ -1104,7 +1104,7 @@ class AVStreamInference:
         if self.face_detector == "none":
             self.tracker = None
         elif self.face_detector == "mediapipe":
-            from visual_preprocessor import FaceMediaPipeStreamTracker
+            from face_detector import FaceMediaPipeStreamTracker
 
             ta = self._tracker_args
             self.tracker = FaceMediaPipeStreamTracker(

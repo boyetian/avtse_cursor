@@ -6,7 +6,7 @@ import numpy as np
 import soundfile as sf
 
 from stream_inference_SDK import StreamInferenceSDK, StreamProcessor
-from visual_preprocessor import VisualPreprocessor
+from face_detector import VisualPreprocessor
 
 
 def _load_video_frames_bgr(mp4_path: str):
@@ -15,7 +15,7 @@ def _load_video_frames_bgr(mp4_path: str):
         raise RuntimeError(f"failed to open video: {mp4_path}")
     fps = float(cap.get(cv2.CAP_PROP_FPS))
     if not np.isfinite(fps) or fps <= 1e-3:
-        fps = 25.0
+        fps = 24.0
     frames = []
     while True:
         ok, frame = cap.read()

@@ -37,7 +37,7 @@ def load_video_frames_bgr(mp4_path: str) -> Tuple[List[np.ndarray], float]:
         raise RuntimeError(f"failed to open video: {mp4_path}")
     fps = float(cap.get(cv2.CAP_PROP_FPS))
     if not np.isfinite(fps) or fps <= 1e-3:
-        fps = 25.0
+        fps = 24.0
     frames: List[np.ndarray] = []
     while True:
         ok, frame = cap.read()
@@ -65,7 +65,7 @@ def create_tracker(
     target_lock_min_iou: float = 0.15,
 ):
     if face_detector == "mediapipe":
-        from visual_preprocessor import FaceMediaPipeStreamTracker
+        from face_detector import FaceMediaPipeStreamTracker
 
         return FaceMediaPipeStreamTracker(
             detect_every_n=detect_every_n,
@@ -264,7 +264,7 @@ def main() -> None:
     parser.add_argument("--video-dir", type=str, default="./测试用例/视频")
     parser.add_argument("--gt-dir", type=str, default="./测试用例/face_gt")
     parser.add_argument("--face-detector", choices=["haar", "mediapipe"], default="haar")
-    parser.add_argument("--face-detector-model", type=str, default="detector.tflite")
+    parser.add_argument("--face-detector-model", type=str, default="blaze_face_full_range.tflite")
     parser.add_argument("--iou-thr", type=float, default=0.5)
     parser.add_argument("--scene-switch-iou-thr", type=float, default=0.15)
     parser.add_argument("--detect-every-n", type=int, default=5)

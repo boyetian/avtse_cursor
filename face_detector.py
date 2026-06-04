@@ -75,7 +75,7 @@ class FaceMediaPipeStreamTracker:
         detect_max_side: int = 320,
         box_smooth_alpha: float = 0.85,
         score_smooth_alpha: float = 0.5,
-        model_path: str = "detector.tflite",
+        model_path: str = "blaze_face_full_range.tflite",
         min_detection_confidence: float = 0.5,
         use_lip_center_crop: bool = False,
         mouth_keypoint_indices: Tuple[int, ...] = (3,),
@@ -172,6 +172,7 @@ class FaceMediaPipeStreamTracker:
         self, frame_bgr: np.ndarray
     ) -> Tuple[Optional[np.ndarray], Optional[float], List[Tuple[List[float], Optional[float]]], Optional[np.ndarray]]:
         h, w = frame_bgr.shape[:2]
+
         sx = sy = 1.0
         if self.detect_max_side > 0:
             ms = max(h, w)
@@ -254,9 +255,8 @@ class FaceMediaPipeStreamTracker:
                     cand_overlap = _box_iou_xyxy(t_box, candidate_box)
                     if cand_overlap < 0.5:
                         conf_low = (t_conf is None) or (float(t_conf) < self.area_switch_min_confidence)
-                        lip_still = self._lip_motion_detect()
 
-                        if conf_low or lip_still:
+                        if conf_low:
                             matched = False
                             if self._candidate_box is not None:
                                 iou = _box_iou_xyxy(self._candidate_box, candidate_box)
@@ -294,15 +294,6 @@ class FaceMediaPipeStreamTracker:
         target_lip = boxes[ti][3]
         interferer = [(boxes[i][1].tolist(), boxes[i][2]) for i in range(len(boxes)) if i != ti]
         return target, target_score, interferer, target_lip
-
-    def _lip_motion_detect(self) -> bool:
-        """Placeholder: detect whether Active_Target lips are stationary.
-
-        Returns:
-            True if lips appear not moving (condition met for area switch).
-            Currently always returns False (not implemented).
-        """
-        return False
 
     def process_bgr(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, bool]:
         h, w = frame_bgr.shape[:2]
@@ -417,7 +408,7 @@ class VisualPreprocessor:
         detect_max_side: int = 320,
         box_smooth_alpha: float = 0.85,
         score_smooth_alpha: float = 0.5,
-        model_path: str = "detector.tflite",
+        model_path: str = "blaze_face_full_range.tflite",
         min_detection_confidence: float = 0.5,
         use_lip_center_crop: bool = True,
         lip_crop_scale: float = 0.55,

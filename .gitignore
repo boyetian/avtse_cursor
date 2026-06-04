@@ -1,4 +1,5 @@
 *.onnx
+*.png
 *.pyc
 *.wav
 *.mp4

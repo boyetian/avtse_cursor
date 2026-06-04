@@ -32,7 +32,7 @@ class StreamInferenceSDK:
         onnx_num_threads: int = 8,
         ts_path: Optional[str] = None,
         face_detector: str = "haar",
-        face_detector_model_path: str = "detector.tflite",
+        face_detector_model_path: str = "blaze_face_full_range.tflite",
         mediapipe_use_lip_center_crop: int = 0,
         mediapipe_lip_crop_scale: float = 0.55,
         mediapipe_lip_crop_min_px: int = 48,
@@ -79,7 +79,7 @@ class StreamInferenceSDK:
         is_start: bool = False,
         is_end: bool = False,
         sampling_rate: int = 16000,
-        fps: float = 25.0,
+        fps: float = 24.0,
     ) -> List[np.ndarray]:
         audio = self._audio_to_mono_numpy(audio_chunk)
         fps_f = float(fps) if np.isfinite(float(fps)) and float(fps) > 1e-3 else float(self.default_fps)
@@ -105,7 +105,7 @@ class StreamProcessor:
     用法：
         streamer = StreamInferenceSDK(...)
         preprocessor = VisualPreprocessor(...)
-        processor = StreamProcessor(streamer, preprocessor, sr=16000, fps=25.0, infer_chunk_ms=500)
+        processor = StreamProcessor(streamer, preprocessor, sr=16000, fps=24.0, infer_chunk_ms=500)
         while streaming:
             segs = processor.feed_chunk(audio_chunk, video_frames)
         segs = processor.flush()

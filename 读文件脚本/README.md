@@ -1,4 +1,6 @@
-# scripts — 音视频预处理工具
+# 预处理 — 三层流水线第 1 层
+
+将 8 通道 PCM + MP4 视频转换为标准格式 `a_i`, `v_i`，供下游人脸门控消费。
 
 ## prepare_chunk_input.py
 
@@ -46,7 +48,7 @@ python scripts/prepare_chunk_input.py \
 
 ### 输出
 
-每个 PCM+MP4 对输出一个 npz 文件，例如：
+每个 PCM+MP4 对输出一个 npz 文件，对应一次 100ms chunk：
 
 ```
 ./pcm/                          ./processed/
@@ -61,26 +63,22 @@ npz 内容：
 
 | key | shape | dtype | 说明 |
 |---|---|---|---|
-| `audio` | `(1, T)` | float32 | 混好的单通道音频 |
-| `frames` | `(N, H, W, 3)` | uint8 | BGR 视频帧 |
+| `audio` | `(1, T)` | float32 | a_i：混合后的单通道音频 |
+| `frames` | `(N, H, W, 3)` | uint8 | v_i：BGR 视频帧 |
 | `sr` | `[16000]` | int | 采样率 |
-| `fps` | `[25.0]` | float | 帧率 |
+| `fps` | `[24.0]` | float | 帧率 |
 
-### 下游使用
+### 下游使用（流式 import）
 
 ```python
-from scripts.prepare_chunk_input import load_chunk
-import glob
+from prepare_chunk_input import read_8ch_pcm, mix_channels
+import numpy as np
 
-# 加载各 chunk
-chunks = []
-for npz_file in sorted(glob.glob("./processed/*_clean.npz")):
-    audio, frames, sr, fps = load_chunk(npz_file)
-    chunks.append((audio, frames))
+# 模拟流式：每 100ms 到达一个 chunk
+raw_pcm = read_8ch_pcm("chunk_001.pcm", sr=16000, dtype="int16")  # (8, 1600) float32
+a_i = mix_channels(raw_pcm, mode="clean")                          # (1600,) float32 mono
 
-# Case A: 逐 chunk 喂入 SDK
-from stream_inference_SDK import StreamInferenceSDK
-streamer = StreamInferenceSDK()
-outputs_all = run_case_a_stream_chunks(streamer, chunks, sr=sr, fps=fps)
-streamer.close()
+# a_i + v_i → 送入流水线第 2 层（人脸门控）
 ```
+
+完整三层串联见项目根目录 [README.md](../README.md)。

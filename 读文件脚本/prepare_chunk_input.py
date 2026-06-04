@@ -83,7 +83,7 @@ def read_mp4_frames(mp4_path: str):
         raise RuntimeError(f"无法打开视频: {mp4_path}")
     fps = float(cap.get(cv2.CAP_PROP_FPS))
     if not np.isfinite(fps) or fps <= 1e-3:
-        fps = 25.0
+        fps = 24.0
     frames = []
     while True:
         ok, frame = cap.read()

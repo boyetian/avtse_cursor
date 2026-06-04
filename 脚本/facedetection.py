@@ -78,7 +78,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 # STEP 2: Create an FaceDetector object.
-base_options = python.BaseOptions(model_asset_path='detector.tflite')
+base_options = python.BaseOptions(model_asset_path='blaze_face_full_range.tflite')
 options = vision.FaceDetectorOptions(base_options=base_options)
 detector = vision.FaceDetector.create_from_options(options)
 
