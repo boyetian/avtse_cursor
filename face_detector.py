@@ -85,6 +85,8 @@ class FaceMediaPipeStreamTracker:
         area_switch_ratio: float = 1.2,
         area_switch_min_frames: int = 25,
         area_switch_min_confidence: float = 0.6,
+        face_landmarker_path: str = "face_landmarker_v2_with_blendshapes.task",
+        lip_motion_threshold: float = 0.010,
     ):
         self.crop_size = int(crop_size)
         self.face_scale = float(face_scale)
@@ -110,6 +112,15 @@ class FaceMediaPipeStreamTracker:
         self._candidate_box: Optional[np.ndarray] = None
         self._candidate_frames: int = 0
         self._target_lost_frames: int = 0
+        self._face_landmarker_path = str(face_landmarker_path)
+        self._face_landmarker = None  # lazy init
+        self._lip_motion_threshold = float(lip_motion_threshold)
+        self._mar_history: List[float] = []   # mouth aspect ratio (height/eye_dist)
+        self._mwr_history: List[float] = []   # mouth width ratio (width/eye_dist)
+        self._lip_history_maxlen: int = 8     # ~3s history
+        self._lip_motion_score: float = 0.0
+        self._lip_still: bool = True
+        self._lip_detect_interval: int = max(1, int(detect_every_n) * 2)
 
         base_options = python.BaseOptions(model_asset_path=str(model_path))
         options = vision.FaceDetectorOptions(
@@ -168,10 +179,144 @@ class FaceMediaPipeStreamTracker:
         canvas[dst_y1:dst_y2, dst_x1:dst_x2] = frame_bgr[src_y1:src_y2, src_x1:src_x2]
         return canvas
 
+    @property
+    def lip_motion_score(self) -> float:
+        return self._lip_motion_score
+
+    @property
+    def lip_still(self) -> bool:
+        return self._lip_still
+
+    def _init_landmarker(self):
+        """Lazy 初始化 FaceLandmarker（首次使用时加载，不影响启动）。"""
+        if self._face_landmarker is not None:
+            return
+        base_options = python.BaseOptions(model_asset_path=self._face_landmarker_path)
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=1,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
+        )
+        self._face_landmarker = vision.FaceLandmarker.create_from_options(options)
+
+    def _get_lip_features(self, frame_bgr: np.ndarray) -> Optional[Tuple[float, float]]:
+        """用 FaceLandmarker 检测，返回 (mar, mwr) 或 None。
+
+        mar = mouth_height / eye_distance   (姿态不变的嘴部开合比)
+        mwr = mouth_width / eye_distance    (姿态不变的嘴部宽度比)
+        """
+        if self.last_box is None:
+            return None
+        self._init_landmarker()
+
+        h, w = frame_bgr.shape[:2]
+        bx1, by1, bx2, by2 = [int(round(float(v))) for v in self.last_box]
+        face_w, face_h = bx2 - bx1, by2 - by1
+
+        # 1.15x padding 确保眼睛和嘴的 landmarks 都在 crop 内
+        pad_x = max(1, int(face_w * 0.15))
+        pad_y = max(1, int(face_h * 0.15))
+        x1 = max(0, bx1 - pad_x)
+        y1 = max(0, by1 - pad_y)
+        x2 = min(w, bx2 + pad_x)
+        y2 = min(h, by2 + pad_y)
+
+        if x2 - x1 < 16 or y2 - y1 < 16:
+            return None
+
+        crop = frame_bgr[y1:y2, x1:x2]
+        # 降采样加速 FaceLandmarker
+        ch, cw = crop.shape[:2]
+        lip_max_side = 160
+        if max(ch, cw) > lip_max_side:
+            scale = lip_max_side / max(ch, cw)
+            crop = cv2.resize(crop, (max(1, int(cw * scale)), max(1, int(ch * scale))),
+                              interpolation=cv2.INTER_AREA)
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
+        result = self._face_landmarker.detect(mp_img)
+        if not result.face_landmarks:
+            return None
+
+        lm = result.face_landmarks[0]
+        # 13=上唇上缘, 14=下唇下缘, 61=左嘴角, 291=右嘴角, 33=左眼内角, 263=右眼内角
+        upper = np.array([lm[13].x, lm[13].y])
+        lower = np.array([lm[14].x, lm[14].y])
+        left = np.array([lm[61].x, lm[61].y])
+        right = np.array([lm[291].x, lm[291].y])
+        eye_l = np.array([lm[33].x, lm[33].y])
+        eye_r = np.array([lm[263].x, lm[263].y])
+
+        eye_dist = float(np.linalg.norm(eye_l - eye_r))
+        if eye_dist < 0.01:
+            return None
+        mar = float(np.linalg.norm(upper - lower)) / eye_dist
+        mwr = float(np.linalg.norm(left - right)) / eye_dist
+        return (mar, mwr)
+
+    def _lip_motion_detect(self, features: Optional[Tuple[float, float]], skipped: bool = False) -> bool:
+        """双特征判定：mar_std 高 + mwr 不胡乱伸缩 → 说话。
+
+        skipped=True 表示本帧故意跳过（降频），不清空历史也不追加。
+        """
+        if features is None:
+            if not skipped:
+                self._mar_history.clear()
+                self._mwr_history.clear()
+                self._lip_motion_score = 0.0
+                self._lip_still = True
+            return True  # 保守判定不动
+
+        mar, mwr = features
+        self._mar_history.append(mar)
+        self._mwr_history.append(mwr)
+        if len(self._mar_history) > self._lip_history_maxlen:
+            self._mar_history.pop(0)
+            self._mwr_history.pop(0)
+
+        mar_std = float(np.std(self._mar_history))
+        mwr_std = float(np.std(self._mwr_history))
+        self._lip_motion_score = mar_std
+
+        # 嘴在垂直方向充分运动
+        mouth_moving = (mar_std >= 0.022)
+
+        # 抿嘴检测：嘴宽明显缩窄过 且 嘴没有垂直振荡
+        # （如果嘴已经在垂直振荡，即使 mwr 下降也是正常说话）
+        pursing = False
+        if len(self._mwr_history) >= 4:
+            mwr_mean = float(np.mean(self._mwr_history))
+            if mwr_mean > 0.01:
+                mwr_min = float(min(self._mwr_history))
+                pursing = (mwr_min < mwr_mean * 0.85) and (mar_std < 0.030)
+
+        # 排除趋势性变化（如抿嘴→张嘴的单向运动）：
+        # 说话时去均值信号多次穿越零点，单次趋势则很少
+        if mouth_moving and len(self._mar_history) >= 6:
+            mar_arr = np.array(self._mar_history)
+            mar_dm = mar_arr - np.mean(mar_arr)
+            zero_crossings = int(np.sum(np.abs(np.diff(mar_dm > 0))))
+            if zero_crossings < 3:
+                mouth_moving = False
+
+        is_speaking = mouth_moving and not pursing
+        self._lip_still = not is_speaking
+        return self._lip_still
+
     def _detect_all_boxes(
         self, frame_bgr: np.ndarray
     ) -> Tuple[Optional[np.ndarray], Optional[float], List[Tuple[List[float], Optional[float]]], Optional[np.ndarray]]:
         h, w = frame_bgr.shape[:2]
+
+        # 唇动检测：降采样前跑 FaceLandmarker（需要原始分辨率），降低频率省 RTF
+        lip_features = None
+        lip_skipped = True
+        if self.last_box is not None and self.frame_idx % self._lip_detect_interval == 0:
+            lip_features = self._get_lip_features(frame_bgr)
+            lip_skipped = False
+        lip_still = self._lip_motion_detect(lip_features, skipped=lip_skipped)
 
         sx = sy = 1.0
         if self.detect_max_side > 0:
@@ -256,7 +401,7 @@ class FaceMediaPipeStreamTracker:
                     if cand_overlap < 0.5:
                         conf_low = (t_conf is None) or (float(t_conf) < self.area_switch_min_confidence)
 
-                        if conf_low:
+                        if conf_low or lip_still:
                             matched = False
                             if self._candidate_box is not None:
                                 iou = _box_iou_xyxy(self._candidate_box, candidate_box)
@@ -417,6 +562,8 @@ class VisualPreprocessor:
         area_switch_ratio: float = 1.2,
         area_switch_min_frames: int = 25,
         area_switch_min_confidence: float = 0.6,
+        face_landmarker_path: str = "face_landmarker_v2_with_blendshapes.task",
+        lip_motion_threshold: float = 0.010,
     ):
         self._tracker = FaceMediaPipeStreamTracker(
             crop_size=int(crop_size),
@@ -434,6 +581,8 @@ class VisualPreprocessor:
             area_switch_ratio=float(area_switch_ratio),
             area_switch_min_frames=int(area_switch_min_frames),
             area_switch_min_confidence=float(area_switch_min_confidence),
+            face_landmarker_path=str(face_landmarker_path),
+            lip_motion_threshold=float(lip_motion_threshold),
         )
         self._min_detection_confidence = float(min_detection_confidence)
         self._any_face_detected = False
@@ -458,6 +607,8 @@ class VisualPreprocessor:
             "mouth_center": mouth_center,
             "face_box": list(self._tracker.last_box) if self._tracker.last_box is not None else None,
             "detection_score": self._tracker.target_score,
+            "lip_motion_score": self._tracker.lip_motion_score,
+            "lip_still": self._tracker.lip_still,
         }
 
     def process_all_frames(self, frames: list) -> dict:
@@ -495,6 +646,8 @@ class VisualPreprocessor:
         face_valid: List[bool] = []
         face_boxes: List[Optional[List[float]]] = []
         face_box_colors: List[Optional[Tuple[int, int, int]]] = []
+        lip_motion_scores: List[float] = []
+        lip_stills: List[bool] = []
         chunk_has_face = False
 
         for frame_bgr in frames:
@@ -503,6 +656,8 @@ class VisualPreprocessor:
             face_valid.append(result["face_detected"])
             face_boxes.append(result["face_box"])
             face_box_colors.append(confidence_to_bbox_color(result["detection_score"], self._min_detection_confidence))
+            lip_motion_scores.append(result["lip_motion_score"])
+            lip_stills.append(result["lip_still"])
             if result["face_detected"]:
                 chunk_has_face = True
 
@@ -512,4 +667,6 @@ class VisualPreprocessor:
             "any_detected": chunk_has_face,
             "face_boxes": face_boxes,
             "face_box_colors": face_box_colors,
+            "lip_motion_scores": lip_motion_scores,
+            "lip_stills": lip_stills,
         }

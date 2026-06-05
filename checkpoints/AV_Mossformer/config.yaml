@@ -5,24 +5,24 @@ seed: 777
 use_cuda: 1
 
 speaker_no: 2
-mix_lst_path: ./data/tiny_debug/mixture_1train_1val_1test.csv
+mix_lst_path: ./data/3dSTA+LiAuto/mixture_all_2mix.csv
 mix_path_source: path_layout
 audio_direc: /data/megastore/Projects/tianxiaowen/dataset/v2_extracted_wav_aligned_p50_withoutBGM
 mixture_audio_direc: /data/megastore/Projects/tianxiaowen/dataset/v2_extracted_wav_aligned_p50_withoutBGM
-reference_direc: /data/megastore/Datasets/FaceVideoData/opensource_dataset/DH-FaceVid-1K
+reference_direc: /data/megastore/SHARE/FaceVideoData/opensource_dataset/SDK_lip_crop
 audio_sr: 16000
 ref_sr: 24
 use_cached_visual: 1
-visual_cache_root: /data/megastore/Projects/tianxiaowen/dataset/v2_visual_cache
+visual_cache_root: /mnt/nas/megastore2/SHARE/visual_cache
 allow_cache_miss_fallback_mp4: 1
 
-num_workers: 0
-pin_memory: 0
-prefetch_factor: 2
-batch_size: 1
+num_workers: 12
+pin_memory: 1
+prefetch_factor: 6
+batch_size: 32
 accu_grad: 0
-effec_batch_size: 1
-max_length: 2
+effec_batch_size: 32
+max_length: 4
 load_interferer_visual: 0
 streaming_train: 1
 streaming_eval: 1
@@ -34,27 +34,27 @@ streaming_multi_chunk: 1
 streaming_chunk_hop: 8000
 streaming_max_history: 1600
 use_amp: 1
-eval_first_n: 1
+eval_first_n: 1000
 eval_sample_random: 0
 debug_cuda_launch_blocking: 0
 debug_batch_shapes: 0
 debug_sync_cuda: 0
 
 # Load weights from another run (same architecture). 'None' = scratch.
-init_from: 'None'
+init_from: './checkpoints/8-64-3200+16000'
 causal: 1
 path_layout: dh_flat
 
 network_reference:
   cue: lip
   backbone: resnet18
-  emb_size: 64                        # 不变
-  resnet_stage_channels: [24, 48, 96, 192]  # 原 [32, 64, 128, 256]
-  conv3d_kernel: [3, 5, 5]            # 不变
-  use_adaptive_pool: 1                # 不变
-  visual_conv_hidden: 128             # 不变（改小效果很小）
-  resnet_out_channels: 192            # 原 256
-  visual_pw_groups: 1                 # 不变
+  emb_size: 64
+  resnet_stage_channels: [32, 64, 128, 256]
+  conv3d_kernel: [3, 5, 5]
+  use_adaptive_pool: 1
+  visual_conv_hidden: 128
+  resnet_out_channels: 256
+  visual_pw_groups: 1
 
 network_audio:
   backbone: av_mossformer2_tse
@@ -90,8 +90,8 @@ network_audio:
 loss_type: sisdr
 init_learning_rate: 0.0001
 lr_warmup: 1
-lr_warmup_steps: 3000
-max_epoch: 1
+lr_warmup_steps: 15000
+max_epoch: 150
 clip_grad_norm: 5
 stop_on_nan: 1
 save_every_n_train_samples: 0

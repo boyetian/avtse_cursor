@@ -137,6 +137,8 @@ class StreamProcessor:
         self._acc_fv: List[bool] = []
         self._acc_face_boxes: List[Optional[List[float]]] = []
         self._acc_face_box_colors: List[Optional[Tuple[int, int, int]]] = []
+        self._acc_lip_stills: List[bool] = []
+        self._acc_lip_stills_all: List[bool] = []  # never sliced, for get_lip_stills()
         self._first_face_chunk = True
 
         # Crop recording
@@ -169,6 +171,8 @@ class StreamProcessor:
         self._acc_fv = []
         self._acc_face_boxes = []
         self._acc_face_box_colors = []
+        self._acc_lip_stills = []
+        self._acc_lip_stills_all = []
         self._first_face_chunk = True
         self._recorded_crops = []
         self._total_infer_audio_samples = 0
@@ -199,6 +203,10 @@ class StreamProcessor:
         """
         return list(self._acc_face_box_colors)
 
+    def get_lip_stills(self) -> List[bool]:
+        """返回逐帧唇动静止状态，与 get_face_boxes() 对齐。"""
+        return list(self._acc_lip_stills_all)
+
     def feed_chunk(
         self,
         audio_chunk: np.ndarray,   # (C,T) 或 (T,), float32
@@ -227,6 +235,8 @@ class StreamProcessor:
         self._acc_fv.extend(r["face_valid"])
         self._acc_face_boxes.extend(r.get("face_boxes", []))
         self._acc_face_box_colors.extend(r.get("face_box_colors", []))
+        self._acc_lip_stills.extend(r.get("lip_stills", []))
+        self._acc_lip_stills_all.extend(r.get("lip_stills", []))
 
         outputs_all: list = []
 
@@ -234,12 +244,14 @@ class StreamProcessor:
             a_seg = self._acc_audio_buf[:, :self._infer_audio_samples]
             v_seg = self._acc_crops[:self._infer_frames]
             fv_seg = self._acc_fv[:self._infer_frames]
+            ls_seg = self._acc_lip_stills[:self._infer_frames]
 
             self._acc_audio_buf = self._acc_audio_buf[:, self._infer_audio_samples:]
             self._acc_crops = self._acc_crops[self._infer_frames:]
             self._acc_fv = self._acc_fv[self._infer_frames:]
+            self._acc_lip_stills = self._acc_lip_stills[self._infer_frames:]
 
-            if any(fv_seg):
+            if any(fv_seg) and not all(ls_seg):
                 if self._record_crops:
                     self._recorded_crops.append(v_seg)
                 t0 = time.perf_counter()
@@ -268,7 +280,7 @@ class StreamProcessor:
         outputs_all: list = []
 
         if self._acc_audio_buf.ndim >= 2 and self._acc_audio_buf.shape[1] > 0 and self._acc_crops:
-            if any(self._acc_fv):
+            if any(self._acc_fv) and not all(self._acc_lip_stills):
                 if self._record_crops:
                     self._recorded_crops.append(self._acc_crops)
                 t0 = time.perf_counter()
@@ -288,5 +300,6 @@ class StreamProcessor:
         self._acc_audio_buf = np.array([], dtype=np.float32)
         self._acc_crops = []
         self._acc_fv = []
+        self._acc_lip_stills = []
         self._first_face_chunk = True
         return outputs_all

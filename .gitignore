@@ -13,6 +13,9 @@ Miniforge3-Linux-x86_64.sh
 不需要上传/
 测试用例/
 测试结果/
+checkpoints/to be used/
+checkpoints/AV_Mossformer-2.488/
+checkpoints/AV_Mossformer-2.758/
 *.npy
 *.json
 *.txt

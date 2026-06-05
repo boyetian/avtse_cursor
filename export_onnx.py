@@ -17,6 +17,7 @@
 """
 
 import argparse
+import math
 import os
 from typing import Optional
 
@@ -114,9 +115,6 @@ def _use_decoder_ola_conv_for_export(model) -> None:
     if sep is None or not hasattr(sep, "decoder"):
         return
     sep.decoder.clear_fixed_ola_frames()
-    L = sep.decoder.L
-    with torch.no_grad():
-        sep.decoder.ola_conv.weight.copy_(torch.eye(L, dtype=torch.float32).view(L, 1, L))
     print("[export] decoder OLA: ConvTranspose (RKNN sep, no ScatterElements)")
 
 
@@ -274,7 +272,7 @@ def compute_stream_window_lengths(
     hop_samples = max(1, int(round(float(audio_sr) * (float(infer_chunk_ms) / 1000.0))))
     lookahead_samples = max(0, int(round(float(audio_sr) * (float(lookahead_ms) / 1000.0))))
     t_audio = max(256, context_samples + hop_samples + lookahead_samples)
-    t_ref = max(2, int(round(float(t_audio) / float(audio_sr) * float(ref_sr))))
+    t_ref = max(2, int(math.ceil(float(t_audio) / float(audio_sr) * float(ref_sr))))
     return int(t_audio), int(t_ref)
 
 
@@ -304,7 +302,7 @@ def export_onnx(
             256,
             int(round(float(audio_sr) * (float(context_ms + infer_chunk_ms + lookahead_ms) / 1000.0))),
         )
-        t_ref = max(2, int(round(float(t_audio) / float(audio_sr) * float(ref_sr))))
+        t_ref = max(2, int(math.ceil(float(t_audio) / float(audio_sr) * float(ref_sr))))
 
     dummy_mixture = torch.randn(1, t_audio, dtype=torch.float32)
     dummy_ref = torch.randn(1, t_ref, int(image_size), int(image_size), 3, dtype=torch.float32)

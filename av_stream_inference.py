@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from typing import Any, List, Optional, Sequence, Tuple
 
 import cv2
-import librosa
+try:
+    import librosa
+except ImportError:
+    librosa = None
 import numpy as np
 import torch
 import yaml
@@ -744,6 +747,75 @@ def _stack_video_for_model(vid_norm_list, use_numpy_path: bool, device) -> Any:
     return torch.from_numpy(vid_full_np).unsqueeze(0).to(device, non_blocking=True)
 
 
+def _virtual_full_buffer_via_windows(
+    wav_full: np.ndarray,          # [1, T]
+    vid_full: np.ndarray,          # [1, T_v, H, W, 3] or [1, T_v, H, W]
+    model,
+    device,
+    hop_samples: int,
+    context_samples: int,
+    lookahead_samples: int,
+    audio_sr: int,
+    ref_sr: float,
+    produced_samples: int,
+    end_emit: int,
+    use_numpy_path: bool,
+    vid_face_valid,
+    fixed_t_audio: int,
+    fixed_t_ref: int,
+):
+    """定长 ONNX 模型的虚拟全量推理：内部逐窗处理，拼接后返回 hop 片段列表。"""
+    new_segments = []
+    total_samples = int(wav_full.shape[1])
+    p = int(produced_samples)
+    while p < end_emit:
+        cur_start = p
+        cur_end = min(cur_start + hop_samples, end_emit)
+        win_start = max(0, cur_start - context_samples)
+        if win_start > 0:
+            win_end = win_start + fixed_t_audio
+        else:
+            win_end = min(cur_end, total_samples)
+
+        v_start = _to_video_index(win_start, audio_sr, ref_sr)
+        v_end = v_start + fixed_t_ref
+        if use_numpy_path:
+            v_start = max(0, min(v_start, vid_full.shape[1] - 1))
+            v_end = max(v_start + 1, min(v_end, vid_full.shape[1]))
+        else:
+            v_start = max(0, min(v_start, int(vid_full.shape[1]) - 1))
+            v_end = max(v_start + 1, min(v_end, int(vid_full.shape[1])))
+        if win_end <= win_start or v_end <= v_start:
+            break
+
+        if use_numpy_path:
+            a_in = wav_full[:, win_start:win_end]
+            r_in = vid_full[:, v_start:v_end]
+            y_win = model.call_numpy(a_in, r_in).squeeze().astype(np.float32, copy=False)
+        else:
+            a_in_t = torch.from_numpy(wav_full[:, win_start:win_end]).float().unsqueeze(0).to(device)
+            r_in_t = torch.from_numpy(vid_full[:, v_start:v_end]).float().to(device)
+            with torch.no_grad():
+                y_win = model(a_in_t, r_in_t).squeeze().detach().cpu().numpy().astype(np.float32)
+
+        seg_local_start = max(0, cur_start - win_start)
+        seg_local_end = max(seg_local_start, min(cur_end - win_start, y_win.shape[0]))
+        seg = y_win[seg_local_start:seg_local_end]
+        target_len = cur_end - cur_start
+        if seg.shape[0] < target_len:
+            seg = np.pad(seg, (0, target_len - seg.shape[0]), mode="constant")
+        elif seg.shape[0] > target_len:
+            seg = seg[:target_len]
+        if vid_face_valid is not None and _hop_should_mute_separated_audio(
+            cur_start, cur_end, audio_sr, ref_sr, vid_face_valid
+        ):
+            seg = np.zeros(target_len, dtype=np.float32)
+        new_segments.append(seg)
+        p = cur_end
+
+    return new_segments, p
+
+
 def _run_new_hops_nonoverlap(
     wav_al: np.ndarray,
     vid_norm_list,
@@ -785,6 +857,18 @@ def _run_new_hops_nonoverlap(
         end_emit = max(int(produced_samples), total_samples - max(0, int(lookahead_samples)))
         if end_emit <= int(produced_samples):
             return new_segments, int(produced_samples)
+
+        # ONNX / 定长输入模型无法一次性处理整段音频，退化为内部逐窗拼接
+        fixed_t_audio = int(getattr(model, "fixed_t_audio", 0) or 0)
+        if fixed_t_audio > 0:
+            return _virtual_full_buffer_via_windows(
+                wav_full, vid_full, model, device,
+                hop_samples, context_samples, lookahead_samples,
+                audio_sr, ref_sr, produced_samples, end_emit,
+                use_numpy_path, vid_face_valid, fixed_t_audio,
+                int(getattr(model, "fixed_t_ref", 0) or 0),
+            )
+
         if use_numpy_path:
             y_full = model.call_numpy(wav_full, vid_full).squeeze().astype(np.float32, copy=False)
         else:
@@ -814,8 +898,21 @@ def _run_new_hops_nonoverlap(
         win_start = max(0, cur_start - context_samples)
         win_end = min(total_samples, cur_end + lookahead_samples)
 
+        # 定长 ONNX 模型需要精确的窗口大小。首跳（win_start=0）不向右扩展，
+        # 让 _fit_time_axis 在后端 zero-pad，与训练首跳无 history 的行为一致。
+        fixed_t_audio = int(getattr(model, "fixed_t_audio", 0) or 0)
+        if fixed_t_audio > 0:
+            needed = fixed_t_audio
+            if (win_end - win_start) < needed and win_start > 0:
+                win_end = min(total_samples, win_start + needed)
+
         v_start = _to_video_index(win_start, audio_sr, ref_sr)
-        v_end = int(np.ceil(float(win_end) / float(audio_sr) * ref_sr))
+        # 定长 ONNX 模型需要精确的帧数，ceil 会导致 14/15 帧交替
+        fixed_t_ref = int(getattr(model, "fixed_t_ref", 0) or 0)
+        if fixed_t_ref > 0:
+            v_end = v_start + fixed_t_ref
+        else:
+            v_end = int(np.ceil(float(win_end) / float(audio_sr) * ref_sr))
         if use_numpy_path:
             v_start = max(0, min(v_start, vid_full.shape[1] - 1))
             v_end = max(v_start + 1, min(v_end, vid_full.shape[1]))
@@ -869,7 +966,9 @@ def _warmup_ingress_forward(
     video_list = [np.zeros((image_size, image_size, 3), dtype=np.float32) for _ in range(n_vid)]
     wav_al, vid_al = _align_audio_video_list(audio, video_list, audio_sr, ref_sr)
     if int(wav_al.shape[0]) < hop_samples or len(vid_al) < 2:
+        print(f"[warmup] skip: wav={wav_al.shape[0]}, vid={len(vid_al)}", flush=True)
         return
+    print(f"[warmup] running inference: wav={wav_al.shape[0]}, vid={len(vid_al)}, hop={hop_samples}", flush=True)
     with torch.no_grad():
         _run_new_hops_nonoverlap(
             wav_al,
@@ -883,6 +982,7 @@ def _warmup_ingress_forward(
             ref_sr,
             0,
         )
+    print("[warmup] inference done", flush=True)
     if getattr(device, "type", "") == "cuda":
         torch.cuda.synchronize()
 
@@ -961,7 +1061,7 @@ class AVStreamInference:
         self.ref_sr = float(getattr(self.ns, "ref_sr"))
         self.image_size = int(getattr(self.ns.network_audio, "image_size", 112))
         self.mean = 0.506362
-        self.std = 0.272877
+        self.std = 0.272887
         self.fixed_chunk_ms = float(infer_chunk_ms)
         self.hop_samples = max(1, int(round(self.audio_sr * (self.fixed_chunk_ms / 1000.0))))
         self.context_samples = max(0, int(round(self.audio_sr * (float(context_ms) / 1000.0))))
@@ -987,6 +1087,7 @@ class AVStreamInference:
                 num_threads=int(onnx_num_threads),
             )
             if int(ingress_warmup) != 0:
+                print("[warmup] starting dummy forward pass (onnx_split)...", flush=True)
                 _warmup_ingress_forward(
                     self.model,
                     self.ns.device,
@@ -997,6 +1098,7 @@ class AVStreamInference:
                     self.context_samples,
                     self.lookahead_samples,
                 )
+                print("[warmup] done", flush=True)
         elif onnx_path:
             self.backend_kind = "onnx"
             self.model = _ONNXModelWrapper(onnx_path, num_threads=int(onnx_num_threads))
@@ -1060,8 +1162,6 @@ class AVStreamInference:
         internal_stream_cache = bool(
             int(getattr(self.ns.network_audio, "stream_cache_enable", 0) or 0)
         )
-        # use_stream_cache=1 且模型无 trim：仅当 yaml 开启*内部* stream cache 时才降级为滑窗。
-        # ONNX / 无内部 cache 的 torch：与 torch 一致走 full-buffer，不依赖 trim_stream_cache。
         if (
             self.use_stream_cache
             and internal_stream_cache

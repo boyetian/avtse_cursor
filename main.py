@@ -198,6 +198,18 @@ def main():
         help="面积切换条件3-1：Active_Target置信度低于此值才允许切换 (默认 0.6)",
     )
     parser.add_argument(
+        "--lip_motion_threshold",
+        type=float,
+        default=0.010,
+        help="唇动判定阈值（嘴部开合比 std），低于此值判定为嘴唇不动 (默认 0.010)",
+    )
+    parser.add_argument(
+        "--face_landmarker_path",
+        type=str,
+        default="face_landmarker_v2_with_blendshapes.task",
+        help="MediaPipe FaceLandmarker 模型路径",
+    )
+    parser.add_argument(
         "--files",
         type=str,
         default="",
@@ -253,11 +265,13 @@ def main():
         else:
             streamer = StreamInferenceSDK(**sdk_kwargs)
 
+    print("[main] streamer init done", flush=True)
+
     out_wav = "./测试结果"
-    # audio_dir = "./测试用例/音频"
-    # video_dir = "./测试用例/视频"
-    audio_dir = "./测试用例/特殊人脸切换示例"
-    video_dir = "./测试用例/特殊人脸切换示例"
+    audio_dir = "./测试用例/音频"
+    video_dir = "./测试用例/视频"
+    # # audio_dir = "./测试用例/音频"
+    # video_dir = "./测试用例/测试用例/video"
 
     out_dir = out_wav
     os.makedirs(out_dir, exist_ok=True)
@@ -280,6 +294,7 @@ def main():
         else:
             raise FileNotFoundError(f"audio path not found: {audio_dir}")
     total_files = len(source_files)
+    print(f"[main] found {total_files} source files in audio_dir", flush=True)
 
     for idx, src_name in enumerate(source_files):
         base_name = os.path.splitext(src_name)[0]
@@ -325,10 +340,13 @@ def main():
                 area_switch_ratio=float(args.area_switch_ratio),
                 area_switch_min_frames=int(args.area_switch_min_frames),
                 area_switch_min_confidence=float(args.area_switch_min_confidence),
+                face_landmarker_path=str(args.face_landmarker_path),
+                lip_motion_threshold=float(args.lip_motion_threshold),
             )
             num_chunks = (len(frames) + v_per_chunk - 1) // v_per_chunk
             all_face_boxes: list = []
             all_face_box_colors: list = []
+            all_lip_stills: list = []
             face_s = 0.0
             for ci in range(num_chunks):
                 v_start = ci * v_per_chunk
@@ -340,6 +358,7 @@ def main():
                 face_s += time.perf_counter() - t0
                 all_face_boxes.extend(r["face_boxes"])
                 all_face_box_colors.extend(r["face_box_colors"])
+                all_lip_stills.extend(r.get("lip_stills", []))
 
             video_dur_s = len(frames) / fps if fps > 1e-9 else 0.0
             face_rtf = face_s / video_dur_s if video_dur_s > 1e-9 else float("nan")
@@ -360,6 +379,12 @@ def main():
                     if box is not None and color is not None:
                         x1, y1, x2, y2 = [int(round(v)) for v in box]
                         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, lineType=cv2.LINE_AA)
+                        # 唇动状态文本
+                        still = all_lip_stills[i] if i < len(all_lip_stills) else True
+                        label = "SILENT" if still else "SPEAKING"
+                        label_color = (0, 0, 255) if still else (0, 255, 0)
+                        cv2.putText(frame, label, (x1, max(y1 - 10, 20)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2, cv2.LINE_AA)
                     writer.write(frame)
                 writer.release()
                 print(f"已保存标注视频: {out_vid}")
@@ -389,6 +414,8 @@ def main():
             area_switch_ratio=float(args.area_switch_ratio),
             area_switch_min_frames=int(args.area_switch_min_frames),
             area_switch_min_confidence=float(args.area_switch_min_confidence),
+            face_landmarker_path=str(args.face_landmarker_path),
+            lip_motion_threshold=float(args.lip_motion_threshold),
         )
 
         # === Part 2+3: StreamProcessor ===
@@ -443,6 +470,7 @@ def main():
         if args.annotate:
             all_boxes = processor.get_face_boxes()
             all_colors = processor.get_face_box_colors()
+            all_lip_stills = processor.get_lip_stills()
             if all_boxes and any(b is not None for b in all_boxes):
                 annotate_dir = str(args.annotate_dir)
                 os.makedirs(annotate_dir, exist_ok=True)
@@ -458,6 +486,11 @@ def main():
                     if box is not None and color is not None:
                         x1, y1, x2, y2 = [int(round(v)) for v in box]
                         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, lineType=cv2.LINE_AA)
+                        still = all_lip_stills[i] if i < len(all_lip_stills) else True
+                        label = "SILENT" if still else "SPEAKING"
+                        label_color = (0, 0, 255) if still else (0, 255, 0)
+                        cv2.putText(frame, label, (x1, max(y1 - 10, 20)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2, cv2.LINE_AA)
                     writer.write(frame)
                 writer.release()
                 print(f"已保存标注视频: {out_vid}")
